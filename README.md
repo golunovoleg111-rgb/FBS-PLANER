@@ -30,3 +30,5 @@ pnpm dev
 
 Публикация выполняется GitHub Actions из ветки `main`. В настройках репозитория Pages должен быть выбран источник **GitHub Actions**.
 
+<!-- Pages deployment -->
+

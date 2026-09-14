@@ -1,10 +1,17 @@
 import * as XLSX from 'xlsx';
-import pdfMake from 'pdfmake/build/pdfmake';
-import pdfFonts from 'pdfmake/build/vfs_fonts';
 import type { PlanRow } from './types';
 
-const bundledFonts = pdfFonts as unknown as { pdfMake?: { vfs: Record<string, string> }; vfs?: Record<string, string> };
-(pdfMake as unknown as { vfs: Record<string, string> }).vfs = bundledFonts.pdfMake?.vfs || bundledFonts.vfs || {};
+declare global { interface Window { pdfMake?: { createPdf: (doc: unknown) => { getBlob: (cb: (blob: Blob) => void) => void } } } }
+
+let pdfPromise: Promise<void> | null = null;
+function script(src: string) {
+  return new Promise<void>((resolve,reject)=>{const el=document.createElement('script');el.src=src;el.onload=()=>resolve();el.onerror=()=>reject(new Error('Не удалось загрузить модуль PDF.'));document.head.appendChild(el);});
+}
+async function loadPdfMake(){
+  if(window.pdfMake)return;
+  if(!pdfPromise)pdfPromise=(async()=>{await script('https://cdn.jsdelivr.net/npm/pdfmake@0.2.23/build/pdfmake.min.js');await script('https://cdn.jsdelivr.net/npm/pdfmake@0.2.23/build/vfs_fonts.js');})();
+  await pdfPromise;
+}
 
 const stamp = () => new Intl.DateTimeFormat('ru-RU', { dateStyle: 'short', timeStyle: 'short' }).format(new Date());
 
@@ -57,7 +64,7 @@ export function requestPdf(rows: PlanRow[]): Promise<Blob> {
     defaultStyle: { font: 'Roboto', fontSize: 9 },
     styles: { title: { fontSize: 18, bold: true, color: '#172033' }, th: { bold: true, color: '#172033' } },
   };
-  return new Promise(resolve => pdfMake.createPdf(doc).getBlob(resolve));
+  return loadPdfMake().then(()=>new Promise(resolve => window.pdfMake!.createPdf(doc).getBlob(resolve)));
 }
 
 export function downloadBlob(blob: Blob, filename: string) {
@@ -65,4 +72,5 @@ export function downloadBlob(blob: Blob, filename: string) {
   const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
+
 

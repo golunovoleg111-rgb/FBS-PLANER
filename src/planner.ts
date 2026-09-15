@@ -72,3 +72,13 @@ export function addManualRows(plan:PlanRow[],items:CatalogItem[],fbs:FbsItem[],f
   return next;
 }
 
+export function removePlanRow(plan: PlanRow[], id: string) {
+  const row = plan.find(item => item.id === id);
+  if (!row) return plan;
+  const wholeBox = row.source === 'auto'
+    && !row.groupId.startsWith('unresolved-')
+    && !row.groupId.startsWith('suggestion-');
+  return plan.filter(item => wholeBox ? item.groupId !== row.groupId : item.id !== id);
+}
+
+

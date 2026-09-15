@@ -1,4 +1,4 @@
-import type { PhysicalBox } from './types';
+import type { PhysicalBox, PhysicalBoxesResult, WarehouseIssue } from './types';
 
 declare global {
   interface Window { google?: { accounts: { oauth2: { initTokenClient: (options: Record<string, unknown>) => { requestAccessToken: (o?: Record<string, unknown>) => void } } } } }
@@ -41,7 +41,30 @@ async function sheetValues(token: string, spreadsheetId: string, range: string) 
   return ((await r.json()) as { values?: unknown[][] }).values || [];
 }
 
-export async function fetchPhysicalBoxes(token: string, spreadsheetId: string): Promise<PhysicalBox[]> {
+export function boxConfirmationKey(box: PhysicalBox) {
+  const source = [box.id, box.totalQty, box.placement, box.storageCells, ...box.components
+    .map(component => `${component.barcode}:${component.qty}`)
+    .sort()].join('|');
+  let hash = 5381;
+  for (let index = 0; index < source.length; index += 1) hash = ((hash << 5) + hash) ^ source.charCodeAt(index);
+  return `${box.id || 'NO-ID'}:${(hash >>> 0).toString(36)}`;
+}
+
+export function assessPhysicalBox(box: PhysicalBox): WarehouseIssue | null {
+  const reasons: string[] = [];
+  const componentsTotal = box.components.reduce((total, component) => total + component.qty, 0);
+  if (!box.id) reasons.push('Не указан BOX_ID — границы коробки нельзя определить.');
+  if (!box.components.length) reasons.push('Не найден состав коробки на листе 21_Состав_коробок.');
+  if (!/confirmed|подтверж/i.test(box.status)) reasons.push(`Статус коробки не подтверждён: «${box.status || 'пусто'}».`);
+  if (box.totalQty <= 0) reasons.push('Не указано итоговое количество коробки.');
+  if (box.components.length && box.totalQty !== componentsTotal) reasons.push(`Состав содержит ${componentsTotal} шт., а итог коробки — ${box.totalQty} шт.`);
+  if (!box.placement && !box.storageCells) reasons.push('Не указано место в расстановке или хранении.');
+  if (box.totalQty > 50) reasons.push(`Объём коробки ${box.totalQty} шт. превышает защитный лимит 50.`);
+  if (!reasons.length) return null;
+  return { key: boxConfirmationKey(box), box, reasons, confirmable: Boolean(box.id && box.components.length) };
+}
+
+export async function fetchPhysicalBoxes(token: string, spreadsheetId: string): Promise<PhysicalBoxesResult> {
   const [boxRows, componentRows] = await Promise.all([
     sheetValues(token, spreadsheetId, '20_Физические_коробки!A:AG'),
     sheetValues(token, spreadsheetId, '21_Состав_коробок!A:L'),
@@ -66,19 +89,21 @@ export async function fetchPhysicalBoxes(token: string, spreadsheetId: string): 
     list.push({ barcode, article: cc.article >= 0 ? clean(row[cc.article]) : '', color: cc.color >= 0 ? clean(row[cc.color]) : '', size: cc.size >= 0 ? clean(row[cc.size]) : '', qty: Math.max(1, n(row[cc.qty])) });
     components.set(id, list);
   });
-  return boxRows.slice(1).map(row => {
+  const parsed = boxRows.slice(1).map(row => {
     const id = clean(row[bc.id]);
     return { id, type: bc.type >= 0 ? clean(row[bc.type]) : '', totalQty: bc.total >= 0 ? n(row[bc.total]) : 0,
       placement: bc.placement >= 0 ? clean(row[bc.placement]) : '', palette: bc.palette >= 0 ? clean(row[bc.palette]) : '',
       side: bc.side >= 0 ? clean(row[bc.side]) : '', level: bc.level >= 0 ? clean(row[bc.level]) : '',
       storageCells: bc.cells >= 0 ? clean(row[bc.cells]) : '', status: bc.status >= 0 ? clean(row[bc.status]) : '', components: components.get(id) || [],
-      _allow: bc.allow >= 0 ? clean(row[bc.allow]) : '',
-    } as PhysicalBox & { _allow: string };
-  }).filter(box => {
-    if (!box.id || !box.components.length || !/confirmed|подтверж/i.test(box.status)) return false;
-    if (box.totalQty <= 50) return true;
-    return /да|yes|true/i.test(box._allow);
+    } as PhysicalBox;
   });
+  const boxes: PhysicalBox[] = [];
+  const issues: WarehouseIssue[] = [];
+  parsed.forEach(box => {
+    const issue = assessPhysicalBox(box);
+    if (issue) issues.push(issue); else boxes.push(box);
+  });
+  return { boxes, issues };
 }
 
 export async function uploadDriveFile(token: string, folderId: string, filename: string, mimeType: string, blob: Blob) {
@@ -92,4 +117,5 @@ export async function uploadDriveFile(token: string, folderId: string, filename:
   if (!r.ok) throw new Error(`Google Drive: ${r.status}. Проверьте ID папки и права OAuth.`);
   return r.json() as Promise<{ id: string; name: string; webViewLink?: string }>;
 }
+
 

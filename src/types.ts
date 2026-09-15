@@ -85,7 +85,13 @@ export type PlanRow = {
   fbs: number;
   fbw: number;
   sales7: number;
+  dailyDemand: number;
+  stockBefore: number;
+  stockAfter: number;
+  supplyDays: number | null;
   target: number;
+  maxStock: number;
+  need: number;
   qty: number;
   palette: string;
   placement: string;
@@ -98,7 +104,9 @@ export type PlanRow = {
 
 export type PlannerSettings = {
   targetDays: number;
-  safetyFactor: number;
+  safetyDays: number;
+  minSupplyDays: number;
+  maxAfterDays: number;
   minOrders: number;
   maxPerSku: number;
 };

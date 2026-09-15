@@ -29,11 +29,16 @@ export function requestXlsx(rows: PlanRow[]) {
     'FBS сейчас': row.fbs,
     'FBW выбранных складов': row.fbw,
     'Продажи 7 дней': row.sales7,
+    'Средние продажи в день': row.dailyDemand,
+    'Остаток до заявки': row.stockBefore,
+    'Остаток после заявки': row.stockAfter,
+    'Целевой остаток': row.target,
+    'Допустимый максимум': row.maxStock,
     'Комментарий': row.reason,
   }));
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.json_to_sheet(data);
-  ws['!cols'] = [14,12,18,20,28,28,10,18,12,12,20,16,48].map(wch => ({ wch }));
+  ws['!cols'] = [14,12,18,20,28,28,10,18,12,12,20,16,20,20,18,22,48].map(wch => ({ wch }));
   XLSX.utils.book_append_sheet(wb, ws, 'Заявка');
   return new Blob([XLSX.write(wb, { bookType: 'xlsx', type: 'array' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
 }

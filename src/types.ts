@@ -55,6 +55,18 @@ export type PhysicalBox = {
   components: BoxComponent[];
 };
 
+export type WarehouseIssue = {
+  key: string;
+  box: PhysicalBox;
+  reasons: string[];
+  confirmable: boolean;
+};
+
+export type PhysicalBoxesResult = {
+  boxes: PhysicalBox[];
+  issues: WarehouseIssue[];
+};
+
 export type PlanRow = {
   id: string;
   groupId: string;
@@ -92,4 +104,5 @@ export type AcceptedRequest = {
   includedWarehouses: string[];
   files?: { xlsx?: string; pdf?: string };
 };
+
 

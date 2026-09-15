@@ -1,0 +1,160 @@
+.reset-button {
+  color: #9b3b38;
+  border-color: #e7c7c5;
+}
+
+.secondary:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.removecol {
+  width: 42px;
+}
+
+.remove-row {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 7px;
+  background: #f5f6f8;
+  color: #8992a2;
+  display: grid;
+  place-items: center;
+}
+
+.remove-row:hover {
+  background: #fee9e7;
+  color: #b13f39;
+}
+
+.sidebar .error-badge {
+  background: #d94b45;
+}
+
+.error-summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.warehouse-issues {
+  display: grid;
+  gap: 12px;
+}
+
+.warehouse-issues article {
+  background: #fff;
+  border: 1px solid #ead9b5;
+  border-left: 4px solid #e2a62a;
+  border-radius: 14px;
+  padding: 18px 20px;
+  box-shadow: 0 4px 14px rgba(35, 49, 78, .035);
+}
+
+.warehouse-issues article.approved {
+  border-color: #b8ddce;
+  border-left-color: #20a66a;
+}
+
+.issue-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.issue-head h3 {
+  font-size: 16px;
+  margin: 9px 0 4px;
+}
+
+.issue-head p {
+  font-size: 10px;
+  color: var(--muted);
+  margin: 0;
+}
+
+.warehouse-issues ul {
+  margin: 15px 0;
+  padding-left: 20px;
+  color: #704f16;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.warehouse-issues details {
+  border-top: 1px solid #edf0f4;
+  padding-top: 12px;
+}
+
+.warehouse-issues summary {
+  cursor: pointer;
+  color: #315be8;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.issue-components {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.issue-components > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #f7f8fa;
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 10px;
+}
+
+.issue-components span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.issue-components small {
+  color: #8992a2;
+}
+
+.issue-components strong {
+  white-space: nowrap;
+}
+
+.cannot-confirm {
+  margin: 12px 0 0;
+  color: #a33f3a;
+  font-size: 10px;
+}
+
+.warehouse-ok svg {
+  color: #20a66a;
+}
+
+@media (max-width: 700px) {
+  .sidebar nav {
+    grid-template-columns: repeat(6, 1fr);
+  }
+
+  .sidebar button svg {
+    width: 19px;
+  }
+
+  .error-summary,
+  .issue-components {
+    grid-template-columns: 1fr;
+  }
+
+  .issue-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+

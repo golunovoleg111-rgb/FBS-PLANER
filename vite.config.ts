@@ -15,8 +15,9 @@ export default defineConfig({
   base: '/FBS-PLANER/',
   build: { rollupOptions: {
     input: path.resolve(__dirname, 'app.html'),
-    output: { entryFileNames: 'assets/app.js', chunkFileNames: 'assets/[name].js', assetFileNames: 'assets/[name][extname]' },
+    output: { entryFileNames: 'assets/app-[hash].js', chunkFileNames: 'assets/[name]-[hash].js', assetFileNames: 'assets/[name]-[hash][extname]' },
   } },
 });
+
 
 

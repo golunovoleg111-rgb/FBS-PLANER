@@ -52,14 +52,21 @@ export type PhysicalBox = {
   level: string;
   storageCells: string;
   status: string;
+  volumeStatus: string;
+  volumeAuto: string;
+  volumeDetail: string;
   components: BoxComponent[];
 };
+
+export type WarehouseIssueCode = 'identity' | 'status' | 'volume' | 'placement' | 'composition' | 'quantity';
 
 export type WarehouseIssue = {
   key: string;
   box: PhysicalBox;
   reasons: string[];
+  codes: WarehouseIssueCode[];
   confirmable: boolean;
+  blockingReason?: string;
 };
 
 export type PhysicalBoxesResult = {

@@ -12,6 +12,9 @@ const validBox: PhysicalBox = {
   level: '2',
   storageCells: 'H1',
   status: 'CONFIRMED',
+  volumeStatus: '✅ ОБЪЕМ НОРМА',
+  volumeAuto: 'ДА',
+  volumeDetail: '10 шт. в пределах нормы.',
   components: [{ barcode: '100', article: 'A', color: 'чёрный', size: '42', qty: 10 }],
 };
 
@@ -21,10 +24,15 @@ describe('warehouse box review', () => {
   });
 
   it('requires explicit review for mismatched or oversized boxes', () => {
-    const issue = assessPhysicalBox({ ...validBox, totalQty: 60 });
-    expect(issue?.confirmable).toBe(true);
-    expect(issue?.reasons.join(' ')).toContain('Состав содержит 10 шт.');
-    expect(issue?.reasons.join(' ')).toContain('превышает защитный лимит 50');
+    const issue = assessPhysicalBox({ ...validBox, totalQty: 60, volumeStatus: '🔴 ПОДОЗРИТЕЛЬНЫЙ ОБЪЕМ', volumeAuto: 'НЕТ' });
+    expect(issue?.reasons.join(' ')).toContain('сумма состава Хранения — 10');
+    expect(issue?.reasons.join(' ')).toContain('Защитный лимит 50');
+    expect(issue?.confirmable).toBe(false);
+  });
+
+  it('allows a compact large box when the spreadsheet volume check permits it', () => {
+    const compact = { ...validBox, totalQty: 60, volumeStatus: '✅ КРУПНАЯ КОРОБКА ДОПУСТИМА', volumeAuto: 'ДА', components: [{ ...validBox.components[0], qty: 60 }] };
+    expect(assessPhysicalBox(compact)).toBeNull();
   });
 
   it('changes the confirmation key when the box composition changes', () => {

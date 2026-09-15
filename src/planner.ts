@@ -13,7 +13,12 @@ export function buildPlan(input: {
   const reserved = new Map<string,number>();
   (input.accepted || []).filter(x=>x.status==='Принята').flatMap(x=>x.rows).forEach(x=>reserved.set(x.barcode,(reserved.get(x.barcode)||0)+x.qty));
   const byArticle = new Map<string,CatalogItem[]>();
-  catalog.forEach(x => { if (!x.barcode) return; const a=byArticle.get(x.article)||[]; if(!a.some(v=>v.barcode===x.barcode))a.push(x); byArticle.set(x.article,a); });
+  catalog.forEach(x => {
+    if (!x.barcode || !fbsMap.has(x.barcode)) return;
+    const a=byArticle.get(x.article)||[];
+    if(!a.some(v=>v.barcode===x.barcode))a.push(x);
+    byArticle.set(x.article,a);
+  });
   const needs = new Map<string,{item:CatalogItem; fbs:number; fbw:number; sales7:number; target:number; need:number}>();
   byArticle.forEach((variants,article) => {
     const sales7=salesMap.get(article)||0;
@@ -33,7 +38,8 @@ export function buildPlan(input: {
   }));
 
   const remaining=new Map([...needs].map(([bc,n])=>[bc,n.need]));
-  const chosen:PhysicalBox[]=[]; const pool=boxes.slice();
+  const chosen:PhysicalBox[]=[];
+  const pool=boxes.filter(box=>box.components.length>0&&box.components.every(component=>fbsMap.has(component.barcode)));
   while(true){
     let best:PhysicalBox|undefined,bestScore=0,bestExcess=Infinity;
     for(const box of pool){

@@ -1,4 +1,4 @@
-import type { PhysicalBox, PhysicalBoxesResult, WarehouseIssue } from './types';
+import type { PhysicalBox, PhysicalBoxesResult, WarehouseIssue, WarehouseIssueCode } from './types';
 
 declare global {
   interface Window { google?: { accounts: { oauth2: { initTokenClient: (options: Record<string, unknown>) => { requestAccessToken: (o?: Record<string, unknown>) => void } } } } }
@@ -52,16 +52,58 @@ export function boxConfirmationKey(box: PhysicalBox) {
 
 export function assessPhysicalBox(box: PhysicalBox): WarehouseIssue | null {
   const reasons: string[] = [];
+  const codes: WarehouseIssueCode[] = [];
   const componentsTotal = box.components.reduce((total, component) => total + component.qty, 0);
-  if (!box.id) reasons.push('Не указан BOX_ID — границы коробки нельзя определить.');
-  if (!box.components.length) reasons.push('Не найден состав коробки на листе 21_Состав_коробок.');
-  if (!/confirmed|подтверж/i.test(box.status)) reasons.push(`Статус коробки не подтверждён: «${box.status || 'пусто'}».`);
-  if (box.totalQty <= 0) reasons.push('Не указано итоговое количество коробки.');
-  if (box.components.length && box.totalQty !== componentsTotal) reasons.push(`Состав содержит ${componentsTotal} шт., а итог коробки — ${box.totalQty} шт.`);
-  if (!box.placement && !box.storageCells) reasons.push('Не указано место в расстановке или хранении.');
-  if (box.totalQty > 50) reasons.push(`Объём коробки ${box.totalQty} шт. превышает защитный лимит 50.`);
+  const status = box.status.replace(/^[^A-ZА-ЯЁ]+/iu, '').trim().toUpperCase();
+  const statusAllowed = status === 'CONFIRMED' || status === 'HEURISTIC_CONFIRMED';
+  const volumeAllowed = norm(box.volumeAuto) === 'да';
+  const compactLargeBox = box.totalQty > 50 && /КРУПНАЯ КОРОБКА ДОПУСТИМА/i.test(box.volumeStatus);
+  const hardVolumeBlock = box.totalQty > 50 && !compactLargeBox;
+
+  if (!box.id) {
+    codes.push('identity');
+    reasons.push('Не указан BOX_ID. Система не может определить границы физической коробки.');
+  }
+  if (!box.components.length) {
+    codes.push('composition');
+    reasons.push('На листе 21_Состав_коробок нет состава из Хранения. Нельзя проверить, какие баркоды находятся внутри.');
+  }
+  if (!statusAllowed) {
+    codes.push('status');
+    reasons.push(`Статус сверки «${box.status || 'пусто'}». Автоматически разрешены только «✅ CONFIRMED» и «🟡 HEURISTIC_CONFIRMED».`);
+  }
+  if (box.totalQty <= 0) {
+    codes.push('quantity');
+    reasons.push('В колонке «Всего шт.» нет положительного количества.');
+  }
+  if (box.components.length && box.totalQty !== componentsTotal) {
+    codes.push('quantity');
+    reasons.push(`Количество расходится: в «Всего шт.» указано ${box.totalQty}, а сумма состава Хранения — ${componentsTotal}.`);
+  }
+  if (!box.placement) {
+    codes.push('placement');
+    reasons.push('Нет подтверждённой ячейки Расстановки. Склад не сможет однозначно найти коробку для перемещения.');
+  }
+  if (!volumeAllowed) {
+    codes.push('volume');
+    reasons.push(`Физический объём не получил автодопуск: «${box.volumeStatus || 'проверка не заполнена'}», флаг «Автодопуск по объёму» — «${box.volumeAuto || 'пусто'}».`);
+  }
+  if (hardVolumeBlock) {
+    codes.push('volume');
+    reasons.push(`В коробке ${box.totalQty} шт. Защитный лимит 50 можно превысить только для малогабаритной группы со статусом «✅ КРУПНАЯ КОРОБКА ДОПУСТИМА».`);
+  }
   if (!reasons.length) return null;
-  return { key: boxConfirmationKey(box), box, reasons, confirmable: Boolean(box.id && box.components.length) };
+  const uniqueCodes = [...new Set(codes)];
+  const blocking: string[] = [];
+  if (!box.id) blocking.push('указать BOX_ID');
+  if (!box.components.length) blocking.push('восстановить состав Хранения');
+  if (!box.placement) blocking.push('указать ячейку Расстановки');
+  if (hardVolumeBlock) blocking.push('исправить или подтвердить малогабаритную группу в таблице');
+  return {
+    key: boxConfirmationKey(box), box, reasons, codes: uniqueCodes,
+    confirmable: blocking.length === 0,
+    blockingReason: blocking.length ? `Сначала нужно: ${blocking.join(', ')}.` : undefined,
+  };
 }
 
 export async function fetchPhysicalBoxes(token: string, spreadsheetId: string): Promise<PhysicalBoxesResult> {
@@ -72,31 +114,44 @@ export async function fetchPhysicalBoxes(token: string, spreadsheetId: string): 
   if (!boxRows.length || !componentRows.length) throw new Error('В листах 20/21 нет данных физического хранения.');
   const bh = boxRows[0], ch = componentRows[0];
   const bc = {
-    id: findCol(bh,['box_id','короб']), type: findCol(bh,['тип']), total: findCol(bh,['итого','количество','qty']),
+    id: findCol(bh,['box_id']), type: findCol(bh,['тип']), total: findCol(bh,['всего шт.','итого','количество','qty']),
     placement: findCol(bh,['расстанов']), palette: findCol(bh,['паллет']), side: findCol(bh,['сторон']), level: findCol(bh,['уров']),
-    cells: findCol(bh,['ячейк','хранен']), status: findCol(bh,['статус']), allow: findCol(bh,['автодопуск']),
+    cells: findCol(bh,['ячейки хранения']), status: findCol(bh,['статус сверки']), volume: findCol(bh,['проверка физ. объема']),
+    volumeAuto: findCol(bh,['автодопуск по объему']), volumeDetail: findCol(bh,['детали объема']),
   };
   const cc = {
     id: findCol(ch,['box_id','короб']), barcode: findCol(ch,['баркод','штрихкод']), article: findCol(ch,['артикул']),
-    color: findCol(ch,['цвет']), size: findCol(ch,['размер']), qty: findCol(ch,['количество','qty']), source: findCol(ch,['источник']),
+    color: findCol(ch,['цвет']), size: findCol(ch,['размер']), qty: findCol(ch,['кол-во','количество','qty']), source: findCol(ch,['источник']),
+    cell: findCol(ch,['ячейка']),
   };
   if (bc.id < 0 || cc.id < 0 || cc.barcode < 0) throw new Error('Не удалось распознать BOX_ID или баркоды в листах 20/21.');
   const components = new Map<string, PhysicalBox['components']>();
+  const seenComponents = new Set<string>();
   componentRows.slice(1).forEach(row => {
     const id = clean(row[cc.id]), barcode = clean(row[cc.barcode]).replace(/\.0$/, '');
     if (!id || !barcode || (cc.source >= 0 && !norm(row[cc.source]).includes('хран'))) return;
+    const qty = n(row[cc.qty]);
+    if (qty <= 0) return;
+    const signature = [id, barcode, qty, cc.cell >= 0 ? clean(row[cc.cell]) : '', cc.size >= 0 ? clean(row[cc.size]) : ''].join('|');
+    if (seenComponents.has(signature)) return;
+    seenComponents.add(signature);
     const list = components.get(id) || [];
-    list.push({ barcode, article: cc.article >= 0 ? clean(row[cc.article]) : '', color: cc.color >= 0 ? clean(row[cc.color]) : '', size: cc.size >= 0 ? clean(row[cc.size]) : '', qty: Math.max(1, n(row[cc.qty])) });
+    list.push({ barcode, article: cc.article >= 0 ? clean(row[cc.article]) : '', color: cc.color >= 0 ? clean(row[cc.color]) : '', size: cc.size >= 0 ? clean(row[cc.size]) : '', qty });
     components.set(id, list);
   });
-  const parsed = boxRows.slice(1).map(row => {
+  const parsedById = new Map<string, PhysicalBox>();
+  boxRows.slice(1).forEach(row => {
     const id = clean(row[bc.id]);
-    return { id, type: bc.type >= 0 ? clean(row[bc.type]) : '', totalQty: bc.total >= 0 ? n(row[bc.total]) : 0,
+    if (!id || parsedById.has(id)) return;
+    parsedById.set(id, { id, type: bc.type >= 0 ? clean(row[bc.type]) : '', totalQty: bc.total >= 0 ? n(row[bc.total]) : 0,
       placement: bc.placement >= 0 ? clean(row[bc.placement]) : '', palette: bc.palette >= 0 ? clean(row[bc.palette]) : '',
       side: bc.side >= 0 ? clean(row[bc.side]) : '', level: bc.level >= 0 ? clean(row[bc.level]) : '',
-      storageCells: bc.cells >= 0 ? clean(row[bc.cells]) : '', status: bc.status >= 0 ? clean(row[bc.status]) : '', components: components.get(id) || [],
-    } as PhysicalBox;
+      storageCells: bc.cells >= 0 ? clean(row[bc.cells]) : '', status: bc.status >= 0 ? clean(row[bc.status]) : '',
+      volumeStatus: bc.volume >= 0 ? clean(row[bc.volume]) : '', volumeAuto: bc.volumeAuto >= 0 ? clean(row[bc.volumeAuto]) : '',
+      volumeDetail: bc.volumeDetail >= 0 ? clean(row[bc.volumeDetail]) : '', components: components.get(id) || [],
+    });
   });
+  const parsed = [...parsedById.values()];
   const boxes: PhysicalBox[] = [];
   const issues: WarehouseIssue[] = [];
   parsed.forEach(box => {

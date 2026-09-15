@@ -16,11 +16,19 @@ describe('planning rules',()=>{
     expect(without[0].qty).toBe(12);
   });
   it('keeps all components of a chosen physical BOX_ID',()=>{
-    const box:PhysicalBox={id:'BOX-7',type:'MIX',totalQty:8,placement:'R-1',palette:'P-1',side:'A',level:'2',storageCells:'H1',status:'CONFIRMED',components:[{barcode:'100',article:'A',color:'',size:'42',qty:5},{barcode:'200',article:'B',color:'',size:'44',qty:3}]};
-    const rows=buildPlan({...base,fbw:[],includedWarehouses:[],boxes:[box]});
+    const box:PhysicalBox={id:'BOX-7',type:'MIX',totalQty:8,placement:'R-1',palette:'P-1',side:'A',level:'2',storageCells:'H1',status:'CONFIRMED',volumeStatus:'✅ ОБЪЕМ НОРМА',volumeAuto:'ДА',volumeDetail:'',components:[{barcode:'100',article:'A',color:'',size:'42',qty:5},{barcode:'200',article:'B',color:'',size:'44',qty:3}]};
+    const rows=buildPlan({...base,fbs:[...base.fbs,{barcode:'200',article:'B',name:'Рубашка',size:'44',quantity:1}],fbw:[],includedWarehouses:[],boxes:[box]});
     expect(rows.filter(x=>x.groupId==='BOX-7')).toHaveLength(2);
     expect(rows.find(x=>x.barcode==='200')?.reason).toContain('MIX');
     expect(removePlanRow(rows,rows[0].id).filter(x=>x.groupId==='BOX-7')).toHaveLength(0);
+  });
+  it('does not add catalog or MIX-box barcodes that are absent from current FBS sales stock',()=>{
+    const catalogWithNew=[...catalog,{barcode:'200',article:'A',name:'Брюки',color:'голубой',size:'44'}];
+    const box:PhysicalBox={id:'BOX-NEW',type:'MIX',totalQty:8,placement:'R-2',palette:'P-1',side:'A',level:'2',storageCells:'H2',status:'CONFIRMED',volumeStatus:'✅ ОБЪЕМ НОРМА',volumeAuto:'ДА',volumeDetail:'',components:[{barcode:'100',article:'A',color:'',size:'42',qty:5},{barcode:'200',article:'A',color:'',size:'44',qty:3}]};
+    const rows=buildPlan({...base,catalog:catalogWithNew,fbw:[],includedWarehouses:[],boxes:[box]});
+    expect(rows.some(row=>row.barcode==='200')).toBe(false);
+    expect(rows.some(row=>row.groupId==='BOX-NEW')).toBe(false);
+    expect(rows.find(row=>row.barcode==='100')?.groupId).toBe('unresolved-100');
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildPlan } from '../src/planner';
+import { buildPlan, removePlanRow } from '../src/planner';
 import type { PhysicalBox } from '../src/types';
 
 const catalog=[{barcode:'100',article:'A',name:'Брюки',color:'голубой',size:'42'}];
@@ -20,6 +20,8 @@ describe('planning rules',()=>{
     const rows=buildPlan({...base,fbw:[],includedWarehouses:[],boxes:[box]});
     expect(rows.filter(x=>x.groupId==='BOX-7')).toHaveLength(2);
     expect(rows.find(x=>x.barcode==='200')?.reason).toContain('MIX');
+    expect(removePlanRow(rows,rows[0].id).filter(x=>x.groupId==='BOX-7')).toHaveLength(0);
   });
 });
+
 

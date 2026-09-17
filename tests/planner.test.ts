@@ -1,50 +1,51 @@
 import { describe, expect, it } from 'vitest';
-import { buildPlan, removePlanRow } from '../src/planner';
-import type { PhysicalBox } from '../src/types';
+import { buildPlan } from '../src/planner';
+import type { PhysicalBox, PlannerSettings } from '../src/types';
 
-const catalog=[{barcode:'100',article:'A',name:'Брюки',color:'голубой',size:'42'}];
-const sales=[{article:'A',ordered:7,bought:5,revenue:0}];
-const settings={targetDays:7,safetyDays:2,minSupplyDays:5,maxAfterDays:14,minOrders:1,maxPerSku:40};
-const base={fbs:[{barcode:'100',article:'A',name:'Брюки',size:'42',quantity:2}],sales,catalog,settings};
+const settings: PlannerSettings = { targetDays: 7, safetyDays: 2, maxAfterDays: 14, minOrders: 1, maxPerSku: 40, boxType: 'ANY', maxBoxes: null, maxUnits: null, fbwMode: 'NONE', includedWarehouses: [] };
+const catalog = [{ barcode: '100', article: 'A', name: 'Брюки', color: 'синий', size: '42' }];
+const sales = [{ barcode: '100', article: 'A', name: 'Брюки', size: '42', ordered: 14, bought: 14, revenue: 0 }];
+const box = (id: string, components = [{ barcode: '100', article: 'A', color: 'синий', size: '42', qty: 10 }], type: 'MONO'|'MIX' = 'MONO', palette = 'P1'): PhysicalBox => ({ id, type, totalQty: components.reduce((n,x)=>n+x.qty,0), placement: 'A1', palette, side: 'A', level: '2', storageCells: 'Лист1!A1', status: 'SOURCE', warehouse: 'Склад №1', sourceSheet: 'Хранение', sourceColumn: 'G', note: '', components });
+const base = { fbs: [{ barcode: '100', article: 'A', name: 'Брюки', size: '42', quantity: 0 }], salesCurrent: sales, salesPrevious: sales, fbw: [], catalog, boxes: [box('B1')], accepted: [], settings };
 
-describe('planning rules',()=>{
-  it('subtracts only selected FBW warehouses',()=>{
-    const fbw=[{barcode:'100',article:'A',size:'42',inTransit:0,returnsInTransit:0,total:15,warehouses:{Коледино:12,Тула:3}}];
-    const withOne=buildPlan({...base,fbw,includedWarehouses:['Коледино']});
-    const without=buildPlan({...base,fbw,includedWarehouses:[]});
-    expect(withOne).toHaveLength(0);
-    expect(without[0].qty).toBe(7);
+describe('physical planning', () => {
+  it('uses barcode-level 70/30 demand and real box quantity', () => {
+    const result = buildPlan(base);
+    expect(result.rows[0]).toMatchObject({ groupId: 'B1', barcode: '100', qty: 10, orders7: 14, ordersPrev7: 14 });
+    expect(result.stats.selectedUnits).toBe(10);
   });
-  it('keeps all components of a chosen physical BOX_ID',()=>{
-    const box:PhysicalBox={id:'BOX-7',type:'MIX',totalQty:8,placement:'R-1',palette:'P-1',side:'A',level:'2',storageCells:'H1',status:'CONFIRMED',volumeStatus:'✅ ОБЪЕМ НОРМА',volumeAuto:'ДА',volumeDetail:'',components:[{barcode:'100',article:'A',color:'',size:'42',qty:5},{barcode:'200',article:'B',color:'',size:'44',qty:3}]};
-    const rows=buildPlan({...base,fbs:[...base.fbs,{barcode:'200',article:'B',name:'Рубашка',size:'44',quantity:1}],sales:[...sales,{article:'B',ordered:7,bought:5,revenue:0}],catalog:[...catalog,{barcode:'200',article:'B',name:'Рубашка',color:'',size:'44'}],fbw:[],includedWarehouses:[],boxes:[box]});
-    expect(rows.filter(x=>x.groupId==='BOX-7')).toHaveLength(2);
-    expect(rows.find(x=>x.barcode==='200')?.reason).toContain('MIX');
-    expect(removePlanRow(rows,rows[0].id).filter(x=>x.groupId==='BOX-7')).toHaveLength(0);
+  it('applies selected FBW mode', () => {
+    const fbw = [{ barcode: '100', article: 'A', size: '42', inTransit: 0, returnsInTransit: 0, total: 20, warehouses: { Коледино: 20 } }];
+    const result = buildPlan({ ...base, fbw, settings: { ...settings, fbwMode: 'SELECTED', includedWarehouses: ['Коледино'] } });
+    expect(result.rows).toHaveLength(0);
   });
-  it('does not add catalog or MIX-box barcodes that are absent from current FBS sales stock',()=>{
-    const catalogWithNew=[...catalog,{barcode:'200',article:'A',name:'Брюки',color:'голубой',size:'44'}];
-    const box:PhysicalBox={id:'BOX-NEW',type:'MIX',totalQty:8,placement:'R-2',palette:'P-1',side:'A',level:'2',storageCells:'H2',status:'CONFIRMED',volumeStatus:'✅ ОБЪЕМ НОРМА',volumeAuto:'ДА',volumeDetail:'',components:[{barcode:'100',article:'A',color:'',size:'42',qty:5},{barcode:'200',article:'A',color:'',size:'44',qty:3}]};
-    const rows=buildPlan({...base,catalog:catalogWithNew,fbw:[],includedWarehouses:[],boxes:[box]});
-    expect(rows.some(row=>row.barcode==='200')).toBe(false);
-    expect(rows.some(row=>row.groupId==='BOX-NEW')).toBe(false);
-    expect(rows.find(row=>row.barcode==='100')?.groupId).toBe('unresolved-100');
+  it('never invents unresolved quantities', () => {
+    const result = buildPlan({ ...base, boxes: [] });
+    expect(result.rows).toHaveLength(0); expect(result.unfilled[0].need).toBeGreaterThan(0);
   });
-  it('does not plan when combined FBS and selected FBW cover the minimum stock days',()=>{
-    const rows=buildPlan({...base,fbs:[{...base.fbs[0],quantity:3}],fbw:[{barcode:'100',article:'A',size:'42',inTransit:0,returnsInTransit:0,total:2,warehouses:{Коледино:2}}],includedWarehouses:['Коледино']});
-    expect(rows).toHaveLength(0);
+  it('holds oversupplying MIX for manual approval', () => {
+    const mix = box('M1', [{ barcode: '100', article: 'A', color: 'синий', size: '42', qty: 20 }], 'MIX');
+    const pending = buildPlan({ ...base, boxes: [mix] });
+    expect(pending.rows).toHaveLength(0); expect(pending.pendingMixBoxIds).toContain('M1');
+    const approved = buildPlan({ ...base, boxes: [mix], approvedMix: new Set(['M1']) });
+    expect(approved.rows[0].groupId).toBe('M1');
   });
-  it('rejects a whole box when any component would exceed its demand limit',()=>{
-    const box:PhysicalBox={id:'BOX-LIMIT',type:'MIX',totalQty:12,placement:'R-1',palette:'P-1',side:'A',level:'2',storageCells:'H1',status:'CONFIRMED',volumeStatus:'✅ ОБЪЕМ НОРМА',volumeAuto:'ДА',volumeDetail:'',components:[{barcode:'100',article:'A',color:'',size:'42',qty:5},{barcode:'200',article:'B',color:'',size:'44',qty:7}]};
-    const rows=buildPlan({...base,fbs:[...base.fbs,{barcode:'200',article:'B',name:'Рубашка',size:'44',quantity:8}],sales:[...sales,{article:'B',ordered:3,bought:2,revenue:0}],catalog:[...catalog,{barcode:'200',article:'B',name:'Рубашка',color:'',size:'44'}],fbw:[],includedWarehouses:[],boxes:[box]});
-    expect(rows.some(row=>row.groupId==='BOX-LIMIT')).toBe(false);
-    expect(rows.find(row=>row.barcode==='100')?.groupId).toBe('unresolved-100');
+  it('respects box and unit limits and prefers fewer palettes', () => {
+    const boxes = [box('B1', undefined, 'MONO', 'P1'), box('B2', undefined, 'MONO', 'P1'), box('B3', undefined, 'MONO', 'P2')];
+    const result = buildPlan({ ...base, salesCurrent: [{ ...sales[0], ordered: 35, bought: 35 }], salesPrevious: [{ ...sales[0], ordered: 35, bought: 35 }], boxes, settings: { ...settings, maxBoxes: 2, maxUnits: 20 } });
+    expect(new Set(result.rows.map(x => x.groupId)).size).toBeLessThanOrEqual(2); expect(result.stats.selectedUnits).toBeLessThanOrEqual(20);
   });
-  it('uses demand classes instead of filling every size to the global maximum',()=>{
-    const rows=buildPlan({...base,fbs:[{...base.fbs[0],quantity:0}],sales:[{...sales[0],ordered:2}],fbw:[],includedWarehouses:[]});
-    expect(rows[0].target).toBe(3);
-    expect(rows[0].maxStock).toBe(4);
+  it('excludes frozen physical BOX_ID', () => {
+    const frozenRows = buildPlan(base).rows;
+    const result = buildPlan({ ...base, accepted: [{ id: 'R1', acceptedAt: new Date().toISOString(), status: 'Заморозка', rows: frozenRows }] });
+    expect(result.rows).toHaveLength(0);
+  });
+  it('handles at least 1500 SKU within a browser-safe time budget', () => {
+    const manyCatalog = Array.from({ length: 1500 }, (_, i) => ({ barcode: String(100000 + i), article: `A${i}`, name: 'Товар', color: 'синий', size: String(40 + i % 10) }));
+    const manySales = manyCatalog.map(x => ({ ...x, ordered: 14, bought: 10, revenue: 0 }));
+    const manyBoxes = manyCatalog.map((x, i) => box(`B${i}`, [{ barcode: x.barcode, article: x.article, color: x.color, size: x.size, qty: 5 }], 'MONO', `P${Math.floor(i/10)}`));
+    const started = performance.now();
+    const result = buildPlan({ fbs: manyCatalog.map(x => ({ ...x, quantity: 0 })), salesCurrent: manySales, salesPrevious: manySales, fbw: [], catalog: manyCatalog, boxes: manyBoxes, accepted: [], settings: { ...settings, maxBoxes: 20, maxUnits: 100 } });
+    expect(result.stats.selectedSku).toBe(1500); expect(result.stats.selectedBoxes).toBeLessThanOrEqual(20); expect(performance.now() - started).toBeLessThan(5000);
   });
 });
-
-

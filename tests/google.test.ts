@@ -1,47 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { assessPhysicalBox, boxConfirmationKey } from '../src/google';
-import type { PhysicalBox } from '../src/types';
+import { normalizeSourceWarehouses, parseStorageGrid } from '../src/google';
 
-const validBox: PhysicalBox = {
-  id: 'BOX-10',
-  type: 'MONO',
-  totalQty: 10,
-  placement: 'R-1',
-  palette: 'P-1',
-  side: 'A',
-  level: '2',
-  storageCells: 'H1',
-  status: 'CONFIRMED',
-  volumeStatus: '✅ ОБЪЕМ НОРМА',
-  volumeAuto: 'ДА',
-  volumeDetail: '10 шт. в пределах нормы.',
-  components: [{ barcode: '100', article: 'A', color: 'чёрный', size: '42', qty: 10 }],
-};
+const storage = { title: 'BELTANEE STORE - Склад', rows: [
+  ['', 'Предмет', 'Цвет', 'Размер', 'Общее упак', '', 'Моно короба', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 'Микс размеров'],
+  ['', '', '', '', '', '', '1'],
+  ['2040000000001', '21_К_Вельвет', 'Синий', '42', '10', '', '10', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '5'],
+  ['2040000000002', '', 'Синий', '44', '5', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '5'],
+], notes: { AD3: 'Большой MIX: проверено кладовщиком' } };
 
-describe('warehouse box review', () => {
-  it('accepts a consistent confirmed box automatically', () => {
-    expect(assessPhysicalBox(validBox)).toBeNull();
+describe('source-of-truth warehouse parser', () => {
+  it('uses a source column as stable physical BOX_ID', () => {
+    const boxes = parseStorageGrid(storage);
+    expect(boxes.map(x => [x.id, x.type, x.totalQty])).toEqual([['ST1-M-2040000000001-G','MONO',10],['ST1-X-AD','MIX',10]]);
+    expect(boxes[1].components).toHaveLength(2); expect(boxes[1].note).toContain('проверено');
   });
-
-  it('requires explicit review for mismatched or oversized boxes', () => {
-    const issue = assessPhysicalBox({ ...validBox, totalQty: 60, volumeStatus: '🔴 ПОДОЗРИТЕЛЬНЫЙ ОБЪЕМ', volumeAuto: 'НЕТ' });
-    expect(issue?.reasons.join(' ')).toContain('сумма состава Хранения — 10');
-    expect(issue?.reasons.join(' ')).toContain('Защитный лимит 50');
-    expect(issue?.confirmable).toBe(false);
-  });
-
-  it('allows a compact large box when the spreadsheet volume check permits it', () => {
-    const compact = { ...validBox, totalQty: 60, volumeStatus: '✅ КРУПНАЯ КОРОБКА ДОПУСТИМА', volumeAuto: 'ДА', components: [{ ...validBox.components[0], qty: 60 }] };
-    expect(assessPhysicalBox(compact)).toBeNull();
-  });
-
-  it('changes the confirmation key when the box composition changes', () => {
-    const changed = { ...validBox, components: [{ ...validBox.components[0], qty: 9 }], totalQty: 9 };
-    expect(boxConfirmationKey(changed)).not.toBe(boxConfirmationKey(validBox));
-  });
-
-  it('does not allow manual confirmation without BOX_ID', () => {
-    expect(assessPhysicalBox({ ...validBox, id: '' })?.confirmable).toBe(false);
+  it('matches a physical source box to a placement cell without changing quantities', () => {
+    const placement = { title: 'Лист1', rows: [['21_К_Вельвет\nСиний\n42р - 10 шт']], notes: {} };
+    const result = normalizeSourceWarehouses([storage], placement);
+    expect(result.boxes.find(x => x.id === 'ST1-M-2040000000001-G')?.placement).toBe('A1');
+    expect(result.boxes.reduce((n,x)=>n+x.totalQty,0)).toBe(20);
   });
 });
-

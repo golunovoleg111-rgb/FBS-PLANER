@@ -1,217 +1,148 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Archive, Boxes, Check, ChevronRight, CircleHelp, Cloud, Download, FileSpreadsheet, LayoutDashboard, PackagePlus, Play, RefreshCw, RotateCcw, Search, Settings, ShieldCheck, Upload, Warehouse, X } from 'lucide-react';
-import { addManualRows, buildPlan, removePlanRow } from './planner';
+import { Archive, Boxes, Check, Cloud, Download, FileSpreadsheet, Filter, LayoutDashboard, Play, Search, Settings, Upload, Warehouse, X } from 'lucide-react';
+import { buildPlan, removePhysicalBox } from './planner';
 import { catalogFromReports, parseCatalog, parseFbs, parseFbw, parseSales } from './parsers';
-import { authorizeGoogle, fetchPhysicalBoxes, uploadDriveFile } from './google';
-import type { AcceptedRequest, CatalogItem, FbsItem, FbwItem, PhysicalBox, PlanRow, PlannerSettings, SalesItem, WarehouseIssue, WarehouseIssueCode } from './types';
+import { authorizeGoogle, fetchSourceWarehouses, uploadDriveFile } from './google';
+import { pickingFromPlan, parsePickingWorkbook, type PickingResult } from './converter';
+import { downloadBlob, pickingPdf, requestPdf, requestXlsx } from './exporters';
+import { audit, exportState, importState, loadSnapshot, saveSnapshot } from './persistence';
+import type { AcceptedRequest, AppSnapshot, CatalogItem, PlanResult, PlannerSettings } from './types';
 import './styles.css';
-import './errors.css';
 
-type Tab = 'reports' | 'planning' | 'new' | 'errors' | 'requests' | 'settings';
-type ReportCardProps = { title: string; hint: string; icon: React.ReactNode; fileName?: string; count?: number; accept?: string; onFile: (file: File) => void };
-type AppSettings = PlannerSettings & { clientId: string; spreadsheetId: string; folderId: string; calculationVersion: number };
-const DEFAULT_SHEET = '1xzmsRY0EJ8xUCMO925pe2lJJOYjqAQdjcTYx-Sl2Yus';
-const LEGACY_FOLDER = '12NUdzjgOj8lyyV98h1wmcIm44UTQRDNQ';
-const DEFAULT_FOLDER = '1kiIXuxeSrRXikELKB9i5D1tJdPy6UrAq';
-const DEFAULT_GOOGLE_CLIENT_ID = '215049650209-ekrrdop4ecn8qkhr31fad0020b3nng57.apps.googleusercontent.com';
-const DEFAULT_SETTINGS: AppSettings = {
-  clientId: DEFAULT_GOOGLE_CLIENT_ID, spreadsheetId: DEFAULT_SHEET, folderId: DEFAULT_FOLDER, calculationVersion: 2,
-  targetDays: 7, safetyDays: 2, minSupplyDays: 5, maxAfterDays: 14, minOrders: 2, maxPerSku: 40,
-};
-const ISSUE_FILTERS: Array<{ id: 'all' | WarehouseIssueCode; label: string; hint: string }> = [
-  { id: 'all', label: 'Все', hint: 'Все коробки с замечаниями' },
-  { id: 'status', label: 'Статус сверки', hint: 'Хранение и расстановка не подтверждены автоматически' },
-  { id: 'volume', label: 'Физический объём', hint: 'Нет автодопуска или превышен защищённый лимит' },
-  { id: 'placement', label: 'Расстановка', hint: 'Не найдена подтверждённая ячейка' },
-  { id: 'composition', label: 'Состав', hint: 'Нет строк состава из Хранения' },
-  { id: 'quantity', label: 'Количество', hint: 'Итог коробки расходится с суммой состава' },
-  { id: 'identity', label: 'BOX_ID', hint: 'Не определена граница физической коробки' },
-];
+type Tab = 'reports' | 'filter' | 'planning' | 'warehouse' | 'requests' | 'picking' | 'audit' | 'settings';
+const CLIENT_ID = '215049650209-ekrrdop4ecn8qkhr31fad0020b3nng57.apps.googleusercontent.com';
+const FOLDER_ID = '1kiIXuxeSrRXikELKB9i5D1tJdPy6UrAq';
+const EMPTY_RESULT: PlanResult = { rows: [], unfilled: [], risks: [], pendingMixBoxIds: [], stats: { eligibleSku: 0, selectedSku: 0, candidateBoxes: 0, selectedBoxes: 0, selectedUnits: 0, elapsedMs: 0 } };
+const DEFAULT_SETTINGS: PlannerSettings = { targetDays: 7, safetyDays: 2, maxAfterDays: 14, minOrders: 1, maxPerSku: 40, boxType: 'ANY', maxBoxes: null, maxUnits: null, fbwMode: 'SELECTED', includedWarehouses: [] };
+const emptySnapshot = (): AppSnapshot => ({ version: 3, savedAt: new Date().toISOString(), fbs: [], salesCurrent: [], salesPrevious: [], fbw: [], catalog: [], boxes: [], issues: [], requests: [], audit: [], settings: DEFAULT_SETTINGS, selectedSku: [], approvedMix: [], removedBoxes: [], connection: { clientId: CLIENT_ID, folderId: FOLDER_ID } });
 
-function useStored<T>(key: string, initial: T) {
-  const [value, setValue] = useState<T>(() => { try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : initial; } catch { return initial; } });
-  useEffect(() => { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* local mode still works */ } }, [key, value]);
-  return [value, setValue] as const;
-}
-
-function ReportCard({ title, hint, icon, fileName, count, accept='.xlsx,.xls', onFile }: ReportCardProps) {
-  const ref = useRef<HTMLInputElement>(null);
-  return <button className={`report-card ${fileName ? 'loaded' : ''}`} onClick={() => ref.current?.click()}>
-    <input ref={ref} hidden type="file" accept={accept} onChange={e => { const f=e.target.files?.[0]; if(f) onFile(f); e.currentTarget.value=''; }} />
-    <span className="report-icon">{fileName ? <Check size={21}/> : icon}</span>
-    <span className="report-copy"><strong>{title}</strong><small>{fileName ? `${fileName}${count !== undefined ? ` · ${count.toLocaleString('ru-RU')} строк` : ''}` : hint}</small></span>
-    <span className="report-action">{fileName ? 'Заменить' : 'Выбрать файл'} <ChevronRight size={15}/></span>
-  </button>;
-}
-
-function Metric({ label, value, note }: { label: string; value: string | number; note: string }) {
-  return <div className="metric"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>;
+function FileCard({ title, text, value, accept = '.xlsx,.xls', onFile }: { title: string; text: string; value?: string; accept?: string; onFile(file: File): void }) {
+  return <label className="file-card"><FileSpreadsheet/><b>{title}</b><span>{value || text}</span><input hidden type="file" accept={accept} onChange={e => { const file = e.target.files?.[0]; if (file) onFile(file); e.currentTarget.value = ''; }}/><em>{value ? 'Заменить' : 'Загрузить'}</em></label>;
 }
 
 function App() {
-  const [tab,setTab]=useState<Tab>('reports');
-  const [fbs,setFbs]=useStored<FbsItem[]>('fbs:data',[]); const [sales,setSales]=useStored<SalesItem[]>('sales:data',[]); const [fbw,setFbw]=useStored<FbwItem[]>('fbw:data',[]);
-  const [catalog,setCatalog]=useStored<CatalogItem[]>('catalog:data',[]); const [warehouses,setWarehouses]=useStored<string[]>('fbw:warehouses',[]); const [included,setIncluded]=useStored<string[]>('fbw:included',[]);
-  const [names,setNames]=useStored<Record<string,string>>('reports:names',{}); const [requests,setRequests]=useStored<AcceptedRequest[]>('requests:data',[]);
-  const [settings,setSettings]=useStored<AppSettings>('app:settings',DEFAULT_SETTINGS);
-  const [boxes,setBoxes]=useState<PhysicalBox[]>([]); const [boxIssues,setBoxIssues]=useState<WarehouseIssue[]>([]); const [confirmedBoxKeys,setConfirmedBoxKeys]=useStored<string[]>('warehouse:confirmed-boxes',[]);
-  const [token,setToken]=useState(''); const [plan,setPlan]=useState<PlanRow[]>([]);
-  const [busy,setBusy]=useState(''); const [notice,setNotice]=useState<{kind:'ok'|'error';text:string}|null>(null); const [tutorial,setTutorial]=useState(false);
-  const [query,setQuery]=useState(''); const [pickedArticle,setPickedArticle]=useState(''); const [pickedSizes,setPickedSizes]=useState<string[]>([]); const [allSizes,setAllSizes]=useState(true);
-  const [issueFilter,setIssueFilter]=useState<'all' | WarehouseIssueCode>('all');
+  const [state, setState] = useState<AppSnapshot>(emptySnapshot);
+  const [ready, setReady] = useState(false);
+  const [tab, setTab] = useState<Tab>('reports');
+  const [plan, setPlan] = useState<PlanResult>(EMPTY_RESULT);
+  const [files, setFiles] = useState<Record<string, string>>({});
+  const [token, setToken] = useState('');
+  const [busy, setBusy] = useState('');
+  const [notice, setNotice] = useState('');
+  const [skuQuery, setSkuQuery] = useState('');
+  const [boxQuery, setBoxQuery] = useState('');
+  const [warehouseFilter, setWarehouseFilter] = useState('Все');
+  const [picking, setPicking] = useState<PickingResult | null>(null);
+  const importRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (!settings.clientId || settings.folderId === LEGACY_FOLDER || settings.calculationVersion !== DEFAULT_SETTINGS.calculationVersion) {
-      setSettings(current => ({
-        ...current,
-        clientId: current.clientId || DEFAULT_GOOGLE_CLIENT_ID,
-        folderId: current.folderId === LEGACY_FOLDER ? DEFAULT_FOLDER : current.folderId,
-        ...(current.calculationVersion !== DEFAULT_SETTINGS.calculationVersion ? {
-          calculationVersion: DEFAULT_SETTINGS.calculationVersion,
-          targetDays: DEFAULT_SETTINGS.targetDays,
-          safetyDays: DEFAULT_SETTINGS.safetyDays,
-          minSupplyDays: DEFAULT_SETTINGS.minSupplyDays,
-          maxAfterDays: DEFAULT_SETTINGS.maxAfterDays,
-          minOrders: DEFAULT_SETTINGS.minOrders,
-          maxPerSku: DEFAULT_SETTINGS.maxPerSku,
-        } : {}),
-      }));
-    }
-  }, [settings.clientId, settings.folderId, settings.calculationVersion, setSettings]);
+  useEffect(() => { loadSnapshot().then(saved => { if (saved) setState({ ...emptySnapshot(), ...saved }); }).catch(() => {}).finally(() => setReady(true)); }, []);
+  useEffect(() => { if (!ready) return; const timer = window.setTimeout(() => void saveSnapshot({ ...state, savedAt: new Date().toISOString() }), 250); return () => window.clearTimeout(timer); }, [state, ready]);
+  const log = (action: string, details: string) => setState(old => ({ ...old, audit: [...old.audit, audit(action, details)] }));
+  const message = (text: string) => { setNotice(text); window.setTimeout(() => setNotice(''), 3500); };
+  const catalog = useMemo(() => { const map = new Map(state.catalog.map(x => [x.barcode, x])); catalogFromReports(state.fbs, state.fbw).forEach(x => map.set(x.barcode, { ...x, ...map.get(x.barcode) })); return [...map.values()]; }, [state.catalog, state.fbs, state.fbw]);
+  const selectedSku = useMemo(() => new Set(state.selectedSku), [state.selectedSku]);
+  const frozenBoxes = useMemo(() => new Set(state.requests.filter(x => x.status === 'Заморозка').flatMap(x => x.rows.map(row => row.groupId))), [state.requests]);
+  const selectedPlanBoxes = useMemo(() => new Set(plan.rows.map(row => row.groupId)), [plan.rows]);
 
-  const mergedCatalog=useMemo(()=>{
-    const source=catalog.length?catalog:catalogFromReports(fbs,fbw); const map=new Map<string,CatalogItem>();
-    source.forEach(x=>map.set(`${x.article}|${x.size}|${x.barcode}`,x)); return [...map.values()];
-  },[catalog,fbs,fbw]);
-  const reportReady=!!fbs.length&&!!sales.length&&!!fbw.length;
-  const approvedIssueBoxes=useMemo(()=>boxIssues.filter(issue=>issue.confirmable&&confirmedBoxKeys.includes(issue.key)).map(issue=>issue.box),[boxIssues,confirmedBoxKeys]);
-  const availableBoxes=useMemo(()=>[...boxes,...approvedIssueBoxes],[boxes,approvedIssueBoxes]);
-  const unresolvedIssues=boxIssues.filter(issue=>!confirmedBoxKeys.includes(issue.key));
-  const issueCounts=useMemo(()=>Object.fromEntries(ISSUE_FILTERS.map(filter=>[
-    filter.id,
-    filter.id==='all' ? boxIssues.length : boxIssues.filter(issue=>issue.codes.includes(filter.id as WarehouseIssueCode)).length,
-  ])) as Record<'all' | WarehouseIssueCode,number>,[boxIssues]);
-  const visibleIssues=issueFilter==='all'?boxIssues:boxIssues.filter(issue=>issue.codes.includes(issueFilter));
-  const selectedRows=plan.filter(x=>x.selected&&x.qty>0); const units=selectedRows.reduce((n,x)=>n+x.qty,0);
-  const groups=new Set(selectedRows.map(x=>x.groupId)).size; const warnings=selectedRows.filter(x=>x.confidence==='warning').length;
-  const articleResults=useMemo(()=>{
-    const q=query.trim().toLowerCase(); if(q.length<2)return [];
-    const by=new Map<string,CatalogItem[]>(); mergedCatalog.filter(x=>`${x.article} ${x.name} ${x.color}`.toLowerCase().includes(q)).forEach(x=>by.set(x.article,[...(by.get(x.article)||[]),x]));
-    return [...by.entries()].slice(0,12);
-  },[query,mergedCatalog]);
-  const currentVariants=useMemo(()=>mergedCatalog.filter(x=>x.article===pickedArticle).sort((a,b)=>a.size.localeCompare(b.size,'ru',{numeric:true})),[mergedCatalog,pickedArticle]);
+  async function loadReport(kind: 'fbs' | 'current' | 'previous' | 'fbw' | 'catalog', file: File) {
+    setBusy(kind);
+    try {
+      const data = await file.arrayBuffer();
+      if (kind === 'fbs') { const value = parseFbs(data); setState(s => ({ ...s, fbs: value, selectedSku: [...new Set([...s.selectedSku, ...value.map(x => x.barcode)])] })); }
+      if (kind === 'current') { const value = parseSales(data); setState(s => ({ ...s, salesCurrent: value, selectedSku: [...new Set([...s.selectedSku, ...value.map(x => x.barcode)])] })); }
+      if (kind === 'previous') { const value = parseSales(data); setState(s => ({ ...s, salesPrevious: value })); }
+      if (kind === 'fbw') { const value = parseFbw(data); setState(s => ({ ...s, fbw: value.items, settings: { ...s.settings, includedWarehouses: value.warehouses } })); }
+      if (kind === 'catalog') { const value = parseCatalog(data); setState(s => ({ ...s, catalog: value })); }
+      setFiles(old => ({ ...old, [kind]: file.name })); log('Импорт отчёта', `${kind}: ${file.name}`); message('Файл прочитан.');
+    } catch (error) { message(error instanceof Error ? error.message : 'Не удалось прочитать файл.'); }
+    finally { setBusy(''); }
+  }
 
-  function alert(kind:'ok'|'error',text:string){setNotice({kind,text});window.setTimeout(()=>setNotice(null),6000);}
-  async function upload(kind:'fbs'|'sales'|'fbw'|'catalog',file:File){
-    setBusy(kind); try { const buf=await file.arrayBuffer();
-      if(kind==='fbs'){const data=parseFbs(buf);setFbs(data);setNames(n=>({...n,fbs:file.name}));}
-      if(kind==='sales'){const data=parseSales(buf);setSales(data);setNames(n=>({...n,sales:file.name}));}
-      if(kind==='fbw'){const data=parseFbw(buf);setFbw(data.items);setWarehouses(data.warehouses);setIncluded(data.warehouses);setNames(n=>({...n,fbw:file.name}));}
-      if(kind==='catalog'){const data=parseCatalog(buf);setCatalog(data);setNames(n=>({...n,catalog:file.name}));}
-      alert('ok',`Файл «${file.name}» прочитан.`);
-    } catch(e){alert('error',e instanceof Error?e.message:'Не удалось прочитать файл.');} finally{setBusy('');}
+  async function refreshWarehouse() {
+    setBusy('google');
+    try {
+      const access = token || await authorizeGoogle(state.connection?.clientId || CLIENT_ID); setToken(access);
+      const result = await fetchSourceWarehouses(access);
+      setState(s => ({ ...s, boxes: result.boxes, issues: result.issues }));
+      log('Обновление склада', `${result.boxes.length} физических BOX_ID из исходных таблиц`); message(`Склад обновлён: ${result.boxes.length} коробов.`);
+    } catch (error) { message(error instanceof Error ? error.message : 'Не удалось загрузить склад.'); }
+    finally { setBusy(''); }
   }
-  async function connect(loadBoxes=true){
-    setBusy('google'); try { const t=await authorizeGoogle(settings.clientId); setToken(t);
-      if(loadBoxes){const data=await fetchPhysicalBoxes(t,settings.spreadsheetId);setBoxes(data.boxes);setBoxIssues(data.issues);alert('ok',`Google подключён: готово ${data.boxes.length} коробок, требуют внимания ${data.issues.length}.`);}else alert('ok','Google Drive подключён.');
-      return t;
-    } catch(e){alert('error',e instanceof Error?e.message:'Не удалось подключить Google.'); throw e;} finally{setBusy('');}
-  }
-  async function calculate(){
-    if(!reportReady){alert('error','Сначала загрузите три отчёта WB.');setTab('reports');return;}
-    let currentBoxes=availableBoxes;
-    if(!boxes.length&&!boxIssues.length){
-      if(!settings.clientId){alert('error','Для планирования по коробкам укажите OAuth Client ID и подключите Google.');setTab('settings');return;}
-      setBusy('planning');
-      try {
-        const t=token||await authorizeGoogle(settings.clientId); setToken(t);
-        const data=await fetchPhysicalBoxes(t,settings.spreadsheetId); setBoxes(data.boxes); setBoxIssues(data.issues);
-        currentBoxes=[...data.boxes,...data.issues.filter(issue=>issue.confirmable&&confirmedBoxKeys.includes(issue.key)).map(issue=>issue.box)];
-      } catch(e) {
-        alert('error',e instanceof Error?e.message:'Не удалось загрузить физические коробки.');
-        return;
-      } finally { setBusy(''); }
-    }
-    const plannerSettings:PlannerSettings={targetDays:settings.targetDays,safetyDays:settings.safetyDays,minSupplyDays:settings.minSupplyDays,maxAfterDays:settings.maxAfterDays,minOrders:settings.minOrders,maxPerSku:settings.maxPerSku};
-    const nextPlan=buildPlan({fbs,sales,fbw,catalog:mergedCatalog,includedWarehouses:included,boxes:currentBoxes,accepted:requests,settings:plannerSettings});
-    const physicalBoxes=new Set(nextPlan.filter(row=>!row.groupId.startsWith('unresolved-')&&!row.groupId.startsWith('suggestion-')).map(row=>row.groupId)).size;
-    const plannedUnits=nextPlan.reduce((total,row)=>total+row.qty,0);
-    setPlan(nextPlan);setTab('planning');
-    alert('ok',nextPlan.length
-      ? `Черновик: ${plannedUnits} шт. из ${physicalBoxes} коробок. Автоплан использует только позиции актуального FBS.`
-      : 'По позициям актуального FBS пополнение сейчас не требуется.');
-  }
-  function toggleRow(id:string){setPlan(rows=>{const row=rows.find(x=>x.id===id);if(!row)return rows;const selected=!row.selected;return rows.map(x=>x.groupId===row.groupId?{...x,selected}:x);});}
-  function changeQty(id:string,value:number){setPlan(rows=>rows.map(x=>{if(x.id!==id)return x;const qty=Math.max(0,Math.round(value)||0);return {...x,qty,stockAfter:x.stockBefore+qty};}));}
-  function removeRow(id:string){setPlan(rows=>removePlanRow(rows,id));}
-  function resetPlan(){setPlan([]);setTab('reports');alert('ok','Черновик сброшен. Загруженные отчёты сохранены.');}
-  function toggleBoxConfirmation(key:string){setConfirmedBoxKeys(keys=>keys.includes(key)?keys.filter(item=>item!==key):[...keys,key]);}
-  async function acceptPlan(){
-    if(!selectedRows.length){alert('error','Выберите хотя бы одну строку.');return;} setBusy('accept');
-    try{
-      const { downloadBlob, requestPdf, requestXlsx } = await import('./exporters');
-      const now=new Date(); const dateLabel=`${String(now.getDate()).padStart(2,'0')}.${String(now.getMonth()+1).padStart(2,'0')}`; const xlsx=requestXlsx(selectedRows); const pdf=await requestPdf(selectedRows);
-      const xlsxName=`Заявка от ${dateLabel}.xlsx`,pdfName=`Заявка от ${dateLabel}.pdf`; let files:AcceptedRequest['files'];
-      if(settings.clientId&&settings.folderId){const t=token||await connect(false);const [x,p]=await Promise.all([uploadDriveFile(t,settings.folderId,xlsxName,xlsx.type,xlsx),uploadDriveFile(t,settings.folderId,pdfName,'application/pdf',pdf)]);files={xlsx:x.webViewLink,pdf:p.webViewLink};}
-      else {downloadBlob(xlsx,xlsxName);downloadBlob(pdf,pdfName);files={};}
-      const request:AcceptedRequest={id:`REQ-${now.getTime()}`,acceptedAt:now.toISOString(),status:'Принята',rows:selectedRows,includedWarehouses:included,files};
-      setRequests(old=>[request,...old]);setPlan([]);setTab('requests');alert('ok',settings.clientId?'Заявка принята, XLSX и PDF сохранены на Google Drive.':'Заявка принята, XLSX и PDF скачаны на компьютер.');
-    }catch(e){alert('error',e instanceof Error?e.message:'Не удалось сформировать заявку.');}finally{setBusy('');}
-  }
-  function chooseArticle(article:string){setPickedArticle(article);setQuery(article);setAllSizes(true);setPickedSizes([]);}
-  function addNovelty(standalone=false){
-    const items=currentVariants.filter(x=>allSizes||pickedSizes.includes(x.size)); if(!items.length){alert('error','Выберите все размеры или хотя бы один размер.');return;}
-    const next=addManualRows(standalone?[]:plan,items,fbs,fbw,included);setPlan(next);setTab('planning');alert('ok',`${items.length} позиций добавлено в черновик. Количество можно изменить.`);
-  }
-  function updateRequest(id:string,status:AcceptedRequest['status']){setRequests(xs=>xs.map(x=>x.id===id?{...x,status}:x));}
 
-  const nav=[['reports','Отчёты',FileSpreadsheet],['planning','Планирование',LayoutDashboard],['new','Добавить в продажу',PackagePlus],['errors','Ошибки склада',AlertTriangle],['requests','Заявки',Archive],['settings','Настройки',Settings]] as const;
-  return <div className="app-shell">
-    <aside className="sidebar"><div className="brand"><span>BF</span><div><b>FBS Planner</b><small>Планирование поставок</small></div></div>
-      <nav>{nav.map(([id,label,Icon])=><button key={id} className={tab===id?'active':''} onClick={()=>setTab(id)}><Icon size={19}/><span>{label}</span>{id==='errors'&&unresolvedIssues.length>0&&<em className="error-badge">{unresolvedIssues.length}</em>}{id==='requests'&&requests.filter(x=>x.status==='Принята').length>0&&<em>{requests.filter(x=>x.status==='Принята').length}</em>}</button>)}</nav>
-      <div className="side-bottom"><button onClick={()=>setTutorial(true)}><CircleHelp size={19}/> Как работать</button><div className="privacy"><ShieldCheck size={18}/><span>Отчёты обрабатываются<br/>в этом браузере</span></div></div>
-    </aside>
-    <main>
-      <header><div><span className="eyebrow">BELTANEE · FBS</span><h1>{nav.find(x=>x[0]===tab)?.[1]}</h1></div><div className="header-actions"><span className={`connection ${token?'on':''}`}><i/>{token?'Google подключён':'Локальный режим'}</span><button className="ghost" onClick={()=>setTutorial(true)}><CircleHelp size={17}/> Инструкция</button></div></header>
-      {tab==='reports'&&<section className="page reports-page">
-        <div className="section-title"><div><h2>Загрузите три свежих отчёта WB</h2><p>Файлы читаются в исходном формате. Предыдущие данные на этом компьютере заменятся.</p></div><span className="step">Шаг 1 из 2</span></div>
-        <div className="report-list">
-          <ReportCard title="Актуальный остаток FBS" hint="Отчёт «Остатки» с баркодами и количеством" icon={<Boxes size={21}/>} fileName={names.fbs} count={fbs.length} onFile={f=>upload('fbs',f)}/>
-          <ReportCard title="Продажи за 7 дней" hint="Отчёт с заказанными и выкупленными товарами" icon={<FileSpreadsheet size={21}/>} fileName={names.sales} count={sales.length} onFile={f=>upload('sales',f)}/>
-          <ReportCard title="Остатки на складах WB (FBW)" hint="Отчёт «Склады WB» — список складов появится ниже" icon={<Warehouse size={21}/>} fileName={names.fbw} count={fbw.length} onFile={f=>upload('fbw',f)}/>
-        </div>
-        {!!warehouses.length&&<div className="warehouse-card"><div className="warehouse-head"><div><h3>Какие склады WB учитывать</h3><p>Снимите галочку со склада, который не должен уменьшать потребность FBS.</p></div><div><button className="link" onClick={()=>setIncluded(warehouses)}>Выбрать все</button><button className="link" onClick={()=>setIncluded([])}>Снять все</button></div></div><div className="warehouse-grid">{warehouses.map(w=><label key={w} className={included.includes(w)?'checked':''}><input type="checkbox" checked={included.includes(w)} onChange={()=>setIncluded(x=>x.includes(w)?x.filter(v=>v!==w):[...x,w])}/><span className="boxcheck"><Check size={13}/></span><span>{w}</span><b>{fbw.reduce((n,x)=>n+(x.warehouses[w]||0),0).toLocaleString('ru-RU')}</b></label>)}</div><div className="warehouse-total"><span>Учитываем {included.length} из {warehouses.length} складов</span><strong>{fbw.reduce((n,x)=>n+included.reduce((m,w)=>m+(x.warehouses[w]||0),0),0).toLocaleString('ru-RU')} шт. на FBW</strong></div></div>}
-        <div className="next-panel"><div><b>{reportReady?'Отчёты готовы к расчёту':'Загрузите недостающие отчёты'}</b><span>{reportReady?'При запуске система загрузит актуальные физические коробки из Google Sheets.':'Для точного расчёта нужны все три файла.'}</span></div><button className="primary" disabled={!reportReady||!!busy} onClick={calculate}><Play size={18}/>{busy==='planning'?'Загружаем коробки…':'Запустить планирование'}</button></div>
+  function calculate() {
+    if (!state.salesCurrent.length || !state.salesPrevious.length) { message('Нужны два недельных отчёта WB: последние и предыдущие 7 дней.'); return; }
+    if (!state.boxes.length) { message('Сначала обновите физический склад из Google Sheets.'); return; }
+    const result = buildPlan({ fbs: state.fbs, salesCurrent: state.salesCurrent, salesPrevious: state.salesPrevious, fbw: state.fbw, catalog, boxes: state.boxes,
+      accepted: state.requests, settings: state.settings, selectedSku: new Set(state.selectedSku), approvedMix: new Set(state.approvedMix), removedBoxes: new Set(state.removedBoxes) });
+    setPlan(result); setTab('planning'); log('Расчёт', `${result.stats.selectedBoxes} коробов, ${result.stats.selectedUnits} изделий, ${result.stats.elapsedMs} мс`);
+  }
+
+  async function freezeRequest() {
+    const rows = plan.rows.filter(row => row.selected); if (!rows.length) return;
+    setBusy('freeze');
+    try {
+      const stamp = new Date().toLocaleDateString('ru-RU').replace(/\./g, '-');
+      const xlsx = requestXlsx(rows), pdf = await requestPdf(rows), pick = await pickingPdf(pickingFromPlan(rows));
+      const names = { xlsx: `Заявка-${stamp}.xlsx`, pdf: `Заявка-${stamp}.pdf`, picking: `Сборочное-задание-${stamp}.pdf` };
+      let links: AcceptedRequest['files'] = {};
+      if (state.connection?.folderId) {
+        const access = token || await authorizeGoogle(state.connection.clientId); setToken(access);
+        const uploaded = await Promise.all([uploadDriveFile(access, state.connection.folderId, names.xlsx, xlsx.type, xlsx), uploadDriveFile(access, state.connection.folderId, names.pdf, 'application/pdf', pdf), uploadDriveFile(access, state.connection.folderId, names.picking, 'application/pdf', pick)]);
+        links = { xlsx: uploaded[0].webViewLink, pdf: uploaded[1].webViewLink, pickingPdf: uploaded[2].webViewLink };
+      } else { downloadBlob(xlsx, names.xlsx); downloadBlob(pdf, names.pdf); downloadBlob(pick, names.picking); }
+      const request: AcceptedRequest = { id: `FBS-${Date.now()}`, acceptedAt: new Date().toISOString(), status: 'Заморозка', rows, files: links };
+      setState(s => ({ ...s, requests: [request, ...s.requests], audit: [...s.audit, audit('Заморозка заявки', `${request.id}: ${new Set(rows.map(x => x.groupId)).size} коробов`)] }));
+      setPlan(EMPTY_RESULT); setTab('requests'); message('Заявка заморожена. Короба исключены из новых расчётов.');
+    } catch (error) { message(error instanceof Error ? error.message : 'Не удалось сформировать заявку.'); }
+    finally { setBusy(''); }
+  }
+
+  function completeRequest(id: string) { setState(s => ({ ...s, requests: s.requests.map(x => x.id === id ? { ...x, status: 'Завершена', completedAt: new Date().toISOString() } : x), audit: [...s.audit, audit('Завершение заявки', id)] })); }
+  function removeMissingBox(requestId: string, boxId: string) { setState(s => ({ ...s, requests: s.requests.map(x => x.id === requestId ? { ...x, rows: x.rows.filter(row => row.groupId !== boxId) } : x), removedBoxes: [...new Set([...s.removedBoxes, boxId])], audit: [...s.audit, audit('Отсутствующий короб удалён', `${requestId}: ${boxId}`)] })); }
+
+  async function makeExternalPicking(file: File) { try { const result = parsePickingWorkbook(await file.arrayBuffer()); setPicking(result); log('Сборочное задание', `${file.name}: ${result.total} изделий`); } catch (error) { message(error instanceof Error ? error.message : 'Не удалось прочитать Excel.'); } }
+  async function downloadPicking() { if (!picking) return; downloadBlob(await pickingPdf(picking), 'Сборочное-задание-FBS.pdf'); }
+
+  const filteredSku = catalog.filter(x => `${x.article} ${x.name} ${x.size} ${x.barcode}`.toLowerCase().includes(skuQuery.toLowerCase())).slice(0, 500);
+  const visibleBoxes = state.boxes.filter(box => (warehouseFilter === 'Все' || box.warehouse === warehouseFilter) && `${box.id} ${box.palette} ${box.placement} ${box.components.map(x => `${x.article} ${x.barcode}`).join(' ')}`.toLowerCase().includes(boxQuery.toLowerCase()));
+  const palettes = useMemo(() => { const map = new Map<string, typeof visibleBoxes>(); visibleBoxes.forEach(box => { const key = `${box.warehouse} · ${box.palette || 'без палеты'}`; map.set(key, [...(map.get(key) || []), box]); }); return [...map]; }, [visibleBoxes]);
+
+  const nav: Array<[Tab, string, React.ReactNode]> = [['reports','Отчёты',<Upload/>],['filter','Фильтр',<Filter/>],['planning','Планирование',<LayoutDashboard/>],['warehouse','Склад',<Warehouse/>],['requests','Заявки',<Archive/>],['picking','Сборка',<Boxes/>],['audit','Аудит',<Check/>],['settings','Настройки',<Settings/>]];
+  return <div className="workspace">
+    <aside><div className="brand">FBS <span>WORKSPACE</span></div><nav>{nav.map(([id, label, icon]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{icon}<span>{label}</span></button>)}</nav><a className="scanner-link" href="https://fbswb.tiovskiy.ru/" target="_blank" rel="noreferrer">Открыть FBS Scanner ↗</a></aside>
+    <main><header className="topbar"><div><b>{nav.find(x => x[0] === tab)?.[1]}</b><span>Источник склада: исходные Google Sheets</span></div><button className="secondary" disabled={busy === 'google'} onClick={() => void refreshWarehouse()}><Cloud/> {busy === 'google' ? 'Обновляем…' : 'Обновить склад'}</button></header>
+
+      {tab === 'reports' && <section className="page"><div className="hero"><h1>Данные для расчёта</h1><p>Спрос считается по barcode: 70% последних 7 дней + 30% предыдущих, с отдельным коэффициентом выкупа.</p></div><div className="file-grid">
+        <FileCard title="Остатки FBS" text="Баркод, артикул, размер, количество" value={files.fbs} onFile={f => void loadReport('fbs', f)}/>
+        <FileCard title="Продажи: последние 7 дней" text="Реальный отчёт supplier-goods WB" value={files.current} onFile={f => void loadReport('current', f)}/>
+        <FileCard title="Продажи: предыдущие 7 дней" text="Такой же отчёт за предыдущую неделю" value={files.previous} onFile={f => void loadReport('previous', f)}/>
+        <FileCard title="Остатки FBW" text="Склады выбираются в фильтре" value={files.fbw} onFile={f => void loadReport('fbw', f)}/>
+        <FileCard title="Номенклатура" text="Необязательно: названия и цвета" value={files.catalog} onFile={f => void loadReport('catalog', f)}/>
+      </div><div className="metrics"><Metric label="FBS SKU" value={state.fbs.length}/><Metric label="Продажи 7 дней" value={state.salesCurrent.length}/><Metric label="Предыдущие 7 дней" value={state.salesPrevious.length}/><Metric label="Физические короба" value={state.boxes.length}/></div></section>}
+
+      {tab === 'filter' && <section className="page"><div className="hero"><h1>Отбор и ограничения</h1><p>Автоматическая заявка содержит только целые найденные BOX_ID.</p></div><div className="filter-grid"><label>Максимум коробов<input type="number" min="1" placeholder="MAX" value={state.settings.maxBoxes ?? ''} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, maxBoxes: e.target.value ? Number(e.target.value) : null } }))}/></label><label>Тип коробов<select value={state.settings.boxType} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, boxType: e.target.value as PlannerSettings['boxType'] } }))}><option value="ANY">Любая</option><option>MONO</option><option>MIX</option></select></label><label>Максимум изделий<input type="number" min="1" placeholder="MAX" value={state.settings.maxUnits ?? ''} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, maxUnits: e.target.value ? Number(e.target.value) : null } }))}/></label><label>FBW<select value={state.settings.fbwMode} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, fbwMode: e.target.value as PlannerSettings['fbwMode'] } }))}><option value="NONE">Не учитывать</option><option value="ALL">Все склады</option><option value="SELECTED">Выбранные</option></select></label></div>
+        {state.settings.fbwMode === 'SELECTED' && <div className="chips">{[...new Set(state.fbw.flatMap(x => Object.keys(x.warehouses)))].map(name => <label key={name}><input type="checkbox" checked={state.settings.includedWarehouses.includes(name)} onChange={() => setState(s => ({ ...s, settings: { ...s.settings, includedWarehouses: s.settings.includedWarehouses.includes(name) ? s.settings.includedWarehouses.filter(x => x !== name) : [...s.settings.includedWarehouses, name] } }))}/>{name}</label>)}</div>}
+        <div className="sku-picker"><div className="picker-head"><label className="search"><Search/><input value={skuQuery} onChange={e => setSkuQuery(e.target.value)} placeholder="Артикул, размер или barcode"/></label><button className="secondary" onClick={() => setState(s => ({ ...s, selectedSku: catalog.map(x => x.barcode) }))}>Выбрать все</button><button className="ghost" onClick={() => setState(s => ({ ...s, selectedSku: [] }))}>Снять все</button></div><div className="sku-list">{filteredSku.map(item => <label key={item.barcode}><input type="checkbox" checked={selectedSku.has(item.barcode)} onChange={() => setState(s => ({ ...s, selectedSku: selectedSku.has(item.barcode) ? s.selectedSku.filter(x => x !== item.barcode) : [...s.selectedSku, item.barcode] }))}/><span><b>{item.article}</b><small>{item.size} · {item.barcode}</small></span></label>)}</div></div><button className="primary run" onClick={calculate}><Play/> Рассчитать по выбранным SKU</button>
       </section>}
-      {tab==='planning'&&<section className="page planning-page">
-        <div className="section-title"><div><h2>Предпросмотр заявки</h2><p>Отключите ненужные строки и исправьте количество. Предупреждения не блокируют принятие.</p></div><div className="row-actions"><button className="secondary reset-button" disabled={!plan.length||!!busy} onClick={resetPlan}><RotateCcw size={17}/> Сбросить</button><button className="secondary" disabled={!!busy} onClick={calculate}><RefreshCw size={17}/> Пересчитать</button><button className="primary" disabled={!selectedRows.length||!!busy} onClick={acceptPlan}><Check size={18}/>{busy==='accept'?'Формируем…':'Принять и создать файлы'}</button></div></div>
-        <div className="plan-scope-note"><ShieldCheck size={18}/><span><b>Автопополнение — только при запасе меньше {settings.minSupplyDays} дней.</b> Учитываются FBS, выбранные склады FBW и активные заявки. После целой коробки ни один размер не может превысить {settings.maxAfterDays} дней запаса и {settings.maxPerSku} шт.</span></div>
-        <div className="metrics"><Metric label="Выбрано" value={`${units} шт.`} note={`${selectedRows.length} строк`}/><Metric label="Коробки и группы" value={groups} note="границы BOX_ID сохранены"/><Metric label="Требуют внимания" value={warnings} note="можно принять своим решением"/><Metric label="Склады FBW" value={included.length} note="учтены в потребности"/></div>
-        {!plan.length?<div className="empty"><LayoutDashboard size={34}/><h3>Черновик пока пуст</h3><p>Загрузите отчёты и запустите расчёт или добавьте новые позиции в продажу.</p><button className="primary" onClick={()=>setTab('reports')}>Перейти к отчётам</button></div>:<div className="table-card"><div className="table-note"><ShieldCheck size={18}/><span><b>«Принять» — ваше окончательное решение.</b> Наведите курсор на статус, чтобы увидеть подробное объяснение расчёта.</span></div><div className="table-scroll"><table><thead><tr><th className="checkcol"></th><th>Коробка / место</th><th>Позиция</th><th>Размер</th><th>FBS</th><th>FBW</th><th>Продажи</th><th>До → после</th><th>Цель / лимит</th><th>В заявку</th><th>Статус</th><th className="removecol"></th></tr></thead><tbody>{plan.map((row,i)=>{const first=i===0||plan[i-1].groupId!==row.groupId;const removesBox=row.source==='auto'&&!row.groupId.startsWith('unresolved-')&&!row.groupId.startsWith('suggestion-');return <tr key={row.id} className={`${row.selected?'':'off'} ${first?'group-start':''}`}><td><label className="tiny-check"><input type="checkbox" checked={row.selected} onChange={()=>toggleRow(row.id)}/><span><Check size={12}/></span></label></td><td>{first&&<div className="box-id"><b>{row.groupId.startsWith('manual-')?'Новинка':row.groupId.startsWith('unresolved-')||row.groupId.startsWith('suggestion-')?'Без коробки':row.groupId}</b><small>{[row.palette,row.placement,row.storageCells].filter(Boolean).join(' · ')||'Количество задаётся вручную'}</small></div>}</td><td><b>{row.article}</b><small>{row.name||row.barcode}</small></td><td>{row.size||'—'}</td><td>{row.fbs}</td><td>{row.fbw}</td><td>{row.sales7}</td><td className="calc-cell"><b>{row.stockBefore} → {row.stockAfter}</b><small>{row.supplyDays===null?'без истории':`${row.supplyDays} дн. запаса`}</small></td><td className="calc-cell"><b>{row.target} / {row.maxStock}</b><small>цель / максимум</small></td><td><input className="qty" type="number" min="0" value={row.qty} disabled={row.source==='auto'&&!row.groupId.startsWith('unresolved-')&&!row.groupId.startsWith('suggestion-')} onChange={e=>changeQty(row.id,Number(e.target.value))}/></td><td><span className={`status ${row.confidence}`} title={row.reason}>{row.confidence==='ok'?'Готово':'Проверить'}</span></td><td><button className="remove-row" title={removesBox?'Убрать всю коробку':'Убрать позицию'} onClick={()=>removeRow(row.id)}><X size={15}/></button></td></tr>})}</tbody></table></div><div className="accept-bar"><span>Будет создано: <b>XLSX + PDF</b>{settings.clientId?' · сохранение на Google Drive':' · скачивание на компьютер'}</span><button className="primary" disabled={!selectedRows.length||!!busy} onClick={acceptPlan}><Check size={18}/> Принять {units} шт.</button></div></div>}
+
+      {tab === 'planning' && <section className="page"><div className="hero"><h1>Расчёт</h1><p>{plan.stats.selectedBoxes} коробов · {plan.stats.selectedUnits} изделий · {plan.stats.elapsedMs} мс</p></div>{plan.pendingMixBoxIds.length > 0 && <div className="warning"><b>MIX с лишними компонентами: {plan.pendingMixBoxIds.length}</b><span>Они не включены без ручного подтверждения.</span><div className="chips">{plan.pendingMixBoxIds.slice(0, 30).map(id => <label key={id}><input type="checkbox" checked={state.approvedMix.includes(id)} onChange={() => setState(s => ({ ...s, approvedMix: s.approvedMix.includes(id) ? s.approvedMix.filter(x => x !== id) : [...s.approvedMix, id] }))}/>{id}</label>)}</div></div>}
+        <div className="metrics"><Metric label="Выбрано коробов" value={plan.stats.selectedBoxes}/><Metric label="Изделий" value={plan.stats.selectedUnits}/><Metric label="Не удалось закрыть" value={plan.unfilled.length}/><Metric label="Риски FBS/FBW" value={plan.risks.length}/></div>
+        {plan.rows.length ? <div className="table-card"><table><thead><tr><th>BOX_ID / место</th><th>SKU</th><th>Спрос</th><th>FBS / FBW</th><th>До → после</th><th>В коробе</th><th></th></tr></thead><tbody>{plan.rows.map((row, i) => { const first = i === 0 || plan.rows[i - 1].groupId !== row.groupId; return <tr key={row.id} className={first ? 'group-start' : ''}><td>{first && <><b>{row.groupId}</b><small>{row.warehouse} · {row.palette} · {row.placement || row.storageCells}</small></>}</td><td><b>{row.article} · {row.size}</b><small>{row.barcode}</small></td><td><b>{row.orders7} / {row.bought7}</b><small>заказы / выкупы · {(row.buyoutRate * 100).toFixed(0)}%</small></td><td>{row.fbs} / {row.fbw}</td><td>{row.stockBefore} → {row.stockAfter}<small>цель {row.target}, max {row.maxStock}</small></td><td><b>{row.qty}</b><small>полезно {row.usefulQty}, лишнее {row.oversupplyQty}</small></td><td>{first && <button className="ghost icon" onClick={() => setPlan(p => ({ ...p, rows: removePhysicalBox(p.rows, row.groupId) }))}><X/></button>}</td></tr>; })}</tbody></table><div className="accept-bar"><span>Фиксация создаст XLSX, PDF заявки и PDF сборочного задания.</span><button className="primary" disabled={busy === 'freeze'} onClick={() => void freezeRequest()}><Check/> {busy === 'freeze' ? 'Формируем…' : 'Заморозить заявку'}</button></div></div> : <div className="empty"><Boxes/><h3>Физические короба не выбраны</h3><p>Задайте фильтры, обновите склад и выполните расчёт.</p></div>}
+        <Diagnostic title="Не удалось закрыть" rows={plan.unfilled.map(x => `${x.article} · ${x.size}: ${x.need} шт. — ${x.reason}`)}/><Diagnostic title="Риск дефицита" rows={plan.unfilled.filter(x => x.criticality >= 3).map(x => `${x.article} · ${x.size}: приоритет ${x.criticality}`)}/><Diagnostic title="FBS / FBW баланс" rows={plan.risks.map(x => `${x.article} · ${x.size}: ${x.message}`)}/>
       </section>}
-      {tab==='new'&&<section className="page new-page"><div className="section-title"><div><h2>Добавить новые позиции в продажу</h2><p>Найдите артикул и выберите все или отдельные размеры. Номенклатура хранится только на этом компьютере.</p></div></div>
-        <div className="catalog-upload"><div><PackagePlus size={22}/><span><b>{catalog.length?`${catalog.length.toLocaleString('ru-RU')} позиций загружено`:'Загрузите номенклатуру WB один раз'}</b><small>{names.catalog||'XLSX с артикулами, баркодами и размерами'}</small></span></div><label className="secondary"><Upload size={17}/>{catalog.length?'Обновить':'Загрузить'}<input hidden type="file" accept=".xlsx,.xls" onChange={e=>{const f=e.target.files?.[0];if(f)upload('catalog',f);e.currentTarget.value='';}}/></label></div>
-        <div className="search-layout"><div className="search-panel"><label className="searchbox"><Search size={19}/><input value={query} onChange={e=>{setQuery(e.target.value);setPickedArticle('');}} placeholder="21_ К _ Вельвет _ голубой"/></label><div className="results">{query.length<2?<p>Введите хотя бы два символа артикула, названия или цвета.</p>:articleResults.length?articleResults.map(([a,items])=><button key={a} className={pickedArticle===a?'active':''} onClick={()=>chooseArticle(a)}><span><b>{a}</b><small>{items[0].name||items[0].color||'Номенклатура WB'} · {items.length} размеров</small></span><ChevronRight size={18}/></button>):<p>Совпадений не найдено.</p>}</div></div>
-          <div className="size-panel">{!pickedArticle?<div className="empty mini"><Search size={28}/><h3>Выберите артикул</h3><p>Справа появятся доступные размеры и остатки.</p></div>:<><span className="eyebrow">ВЫБРАННЫЙ АРТИКУЛ</span><h3>{pickedArticle}</h3><label className={`size-choice all ${allSizes?'selected':''}`}><input type="checkbox" checked={allSizes} onChange={e=>setAllSizes(e.target.checked)}/><span className="boxcheck"><Check size={13}/></span><b>Искать все размеры</b><small>{currentVariants.length} вариантов</small></label><div className="sizes">{currentVariants.map(v=><label key={`${v.barcode}-${v.size}`} className={`size-choice ${!allSizes&&pickedSizes.includes(v.size)?'selected':''}`}><input type="checkbox" disabled={allSizes} checked={allSizes||pickedSizes.includes(v.size)} onChange={()=>setPickedSizes(x=>x.includes(v.size)?x.filter(s=>s!==v.size):[...x,v.size])}/><span className="boxcheck"><Check size={13}/></span><b>{v.size}</b><small>FBS {fbs.find(x=>x.barcode===v.barcode)?.quantity||0} · FBW {fbw.find(x=>x.barcode===v.barcode)?included.reduce((n,w)=>n+(fbw.find(x=>x.barcode===v.barcode)!.warehouses[w]||0),0):0}</small></label>)}</div><div className="novelty-actions"><button className="secondary" onClick={()=>addNovelty(true)}>Создать отдельный черновик</button><button className="primary" onClick={()=>addNovelty(false)}>Добавить в текущий</button></div></>}</div></div>
-      </section>}
-      {tab==='errors'&&<section className="page errors-page">
-        <div className="section-title"><div><h2>Ошибки склада</h2><p>Каждое число здесь означает количество физических коробок, а не изделий.</p></div><button className="secondary" disabled={busy==='google'} onClick={()=>void connect().catch(()=>{})}><RefreshCw size={17}/>{busy==='google'?'Обновляем…':'Обновить из Google'}</button></div>
-        {!token&&!boxIssues.length?<div className="empty"><AlertTriangle size={34}/><h3>Данные склада ещё не загружены</h3><p>Подключите Google, чтобы проверить BOX_ID, состав, количество, статус и место хранения.</p><button className="primary" onClick={()=>void connect().catch(()=>{})}><Cloud size={17}/> Подключить Google</button></div>:!boxIssues.length?<div className="empty warehouse-ok"><ShieldCheck size={34}/><h3>Ошибок склада не найдено</h3><p>{boxes.length} коробок готовы к автоматическому планированию.</p></div>:<>
-          <div className="issue-explainer"><AlertTriangle size={22}/><div><b>{unresolvedIssues.length.toLocaleString('ru-RU')} коробок временно не участвуют в автоплане</b><span>Нажмите категорию ниже, чтобы увидеть причину. Коробку с доступной кнопкой можно проверить физически и разрешить вручную.</span></div></div>
-          <div className="error-summary"><Metric label="Готовы автоматически" value={boxes.length} note="все проверки пройдены"/><Metric label="Требуют проверки" value={unresolvedIssues.length} note="не участвуют в расчёте"/><Metric label="Разрешены вручную" value={approvedIssueBoxes.length} note="участвуют после пересчёта"/></div>
-          <div className="issue-filters">{ISSUE_FILTERS.filter(filter=>filter.id==='all'||issueCounts[filter.id]>0).map(filter=><button key={filter.id} className={issueFilter===filter.id?'active':''} onClick={()=>setIssueFilter(filter.id)} title={filter.hint}><span>{filter.label}</span><b>{issueCounts[filter.id].toLocaleString('ru-RU')}</b><small>{filter.hint}</small></button>)}</div>
-          <div className="warehouse-issues">{visibleIssues.map(issue=>{const approved=confirmedBoxKeys.includes(issue.key);return <article key={issue.key} className={approved?'approved':''}><div className="issue-head"><div><span className={`status ${approved?'ok':'warning'}`}>{approved?'Разрешена вручную':'Нужна проверка'}</span><h3>{issue.box.id||'Коробка без BOX_ID'}</h3><p>{[issue.box.type,issue.box.palette,issue.box.placement,issue.box.storageCells].filter(Boolean).join(' · ')||'Место не указано'} · {issue.box.totalQty} шт.</p></div><button className={approved?'secondary':'primary'} disabled={!issue.confirmable} onClick={()=>toggleBoxConfirmation(issue.key)}>{approved?<><RotateCcw size={16}/> Отменить разрешение</>:<><Check size={16}/> Подтвердить и использовать</>}</button></div><ul>{issue.reasons.map(reason=><li key={reason}>{reason}</li>)}</ul>{issue.box.volumeDetail&&<p className="volume-detail"><b>Детали проверки объёма:</b> {issue.box.volumeDetail}</p>}<details><summary>Показать состав — {issue.box.components.length} позиций</summary><div className="issue-components">{issue.box.components.map((component,index)=><div key={`${component.barcode}-${index}`}><span><b>{component.article||component.barcode}</b><small>{component.barcode} · размер {component.size||'—'}</small></span><strong>{component.qty} шт.</strong></div>)}</div></details>{!issue.confirmable&&<p className="cannot-confirm">{issue.blockingReason||'Коробку нельзя разрешить до исправления обязательных данных.'}</p>}</article>})}</div>
-        </>}
-      </section>}
-      {tab==='requests'&&<section className="page requests-page"><div className="section-title"><div><h2>История принятых заявок</h2><p>Активные заявки уменьшают повторную потребность. Завершите или отмените их после обработки.</p></div></div>{!requests.length?<div className="empty"><Archive size={34}/><h3>Принятых заявок пока нет</h3><p>Черновые расчёты сюда не попадают.</p></div>:<div className="request-list">{requests.map(r=><article key={r.id}><div className="request-main"><span className={`request-status ${r.status}`}>{r.status}</span><div><h3>{r.id}</h3><p>{new Date(r.acceptedAt).toLocaleString('ru-RU')} · {r.rows.reduce((n,x)=>n+x.qty,0)} шт. · {new Set(r.rows.map(x=>x.groupId)).size} групп</p></div></div><div className="request-actions">{r.files?.xlsx&&<a className="ghost" href={r.files.xlsx} target="_blank"><Cloud size={16}/> XLSX</a>}{r.files?.pdf&&<a className="ghost" href={r.files.pdf} target="_blank"><Download size={16}/> PDF</a>}{r.status==='Принята'&&<><button className="secondary" onClick={()=>updateRequest(r.id,'Отменена')}>Отменить</button><button className="primary small" onClick={()=>updateRequest(r.id,'Выполнена')}>Завершить</button></>}</div></article>)}</div>}</section>}
-      {tab==='settings'&&<section className="page settings-page"><div className="section-title"><div><h2>Google и правила расчёта</h2><p>Настройки сохраняются только в браузере этого рабочего компьютера.</p></div></div><div className="settings-grid"><div className="settings-card"><h3><Cloud size={20}/> Google Sheets и Drive</h3><p className="fine">Google уже настроен для сайта. Сотруднику достаточно нажать кнопку ниже и выбрать свой аккаунт.</p><label>ID таблицы хранения<input value={settings.spreadsheetId} onChange={e=>setSettings(s=>({...s,spreadsheetId:e.target.value}))}/></label><label>ID папки Google Drive<input value={settings.folderId} onChange={e=>setSettings(s=>({...s,folderId:e.target.value}))}/></label><button className="primary" disabled={busy==='google'} onClick={()=>void connect().catch(()=>{})}><Cloud size={17}/>{busy==='google'?'Подключаем…':'Войти в Google и загрузить коробки'}</button><p className="fine">Сайт читает BOX_ID из таблицы и сохраняет «Заявка от ДД.ММ.xlsx» и PDF в указанную папку. Токен хранится только в памяти вкладки.</p></div><div className="settings-card"><h3><Settings size={20}/> Потребность FBS</h3><label>Пополнять при запасе меньше, дней<input type="number" min="0" value={settings.minSupplyDays} onChange={e=>setSettings(s=>({...s,minSupplyDays:Number(e.target.value)}))}/></label><label>Целевой запас, дней<input type="number" min="1" value={settings.targetDays} onChange={e=>setSettings(s=>({...s,targetDays:Number(e.target.value)}))}/></label><label>Страховой запас, дней<input type="number" min="0" value={settings.safetyDays} onChange={e=>setSettings(s=>({...s,safetyDays:Number(e.target.value)}))}/></label><label>Максимум после поставки, дней<input type="number" min="1" value={settings.maxAfterDays} onChange={e=>setSettings(s=>({...s,maxAfterDays:Number(e.target.value)}))}/></label><label>Минимум заказов за 7 дней<input type="number" min="0" value={settings.minOrders} onChange={e=>setSettings(s=>({...s,minOrders:Number(e.target.value)}))}/></label><label>Абсолютный максимум на размер<input type="number" min="1" max="50" value={settings.maxPerSku} onChange={e=>setSettings(s=>({...s,maxPerSku:Math.min(50,Number(e.target.value))}))}/></label><p className="fine">Лимит размера дополнительно зависит от скорости продаж: редкий — 0, медленный — 10, средний — 20, хороший — 30, хит — 40. Отчёт продаж WB не содержит размеры, поэтому продажи артикула распределяются между его размерами.</p></div></div></section>}
-    </main>
-    {notice&&<div className={`toast ${notice.kind}`}>{notice.kind==='ok'?<Check size={18}/>:<X size={18}/>}<span>{notice.text}</span></div>}
-    {tutorial&&<div className="modal-back" onMouseDown={()=>setTutorial(false)}><div className="tutorial" onMouseDown={e=>e.stopPropagation()}><button className="modal-x" onClick={()=>setTutorial(false)}><X/></button><span className="eyebrow">БЫСТРАЯ ИНСТРУКЦИЯ</span><h2>От отчётов до заявки — 5 шагов</h2><ol><li><b>Подключите Google.</b><span>Нажмите «Войти в Google» и выберите рабочий аккаунт — Client ID уже настроен на сайте.</span></li><li><b>Загрузите три отчёта и выберите склады FBW.</b><span>FBS, продажи за 7 дней и остатки FBW; ненужные склады отключите галочками.</span></li><li><b>Нажмите «Запустить планирование».</b><span>Система обновит BOX_ID и добавит только размеры с запасом меньше установленного порога. Черновик можно пересчитывать сколько угодно.</span></li><li><b>Проверьте расчёт.</b><span>В колонках видны остатки до и после заявки, цель и допустимый максимум. Целая коробка проходит только целиком и только внутри лимитов.</span></li><li><b>Нажмите «Принять».</b><span>XLSX и PDF с датой сохранятся в настроенную папку Google Drive.</span></li></ol><div className="tutorial-callout">Новинки добавляются отдельно: найдите артикул, выберите «Все размеры» или конкретные размеры и добавьте их в черновик.</div><button className="primary full" onClick={()=>setTutorial(false)}>Понятно, начать работу</button></div></div>}
-  </div>;
+
+      {tab === 'warehouse' && <section className="page"><div className="hero"><h1>Логическая карта склада</h1><p>Палеты, уровни и короба построены из исходного Хранения и Расстановки.</p></div><div className="warehouse-tools"><label className="search"><Search/><input value={boxQuery} onChange={e => setBoxQuery(e.target.value)} placeholder="BOX_ID, артикул, barcode"/></label><select value={warehouseFilter} onChange={e => setWarehouseFilter(e.target.value)}><option>Все</option><option>Склад №1</option><option>Склад №2</option><option>Кимры</option></select></div><div className="palette-grid">{palettes.map(([name, boxes]) => <article className="palette" key={name}><h3>{name}</h3><div>{boxes.sort((a,b) => a.level.localeCompare(b.level, 'ru', { numeric: true })).map(box => <button key={box.id} className={`${selectedPlanBoxes.has(box.id) ? 'selected' : ''} ${frozenBoxes.has(box.id) ? 'frozen' : ''}`} title={box.components.map(x => `${x.article} ${x.size}: ${x.qty}`).join('\n')}><b>{box.id}</b><span>{box.type} · {box.totalQty} шт.</span><small>{box.placement || box.storageCells} · ур. {box.level || '—'}</small>{box.note && <em>Есть комментарий MIX</em>}</button>)}</div></article>)}</div></section>}
+
+      {tab === 'requests' && <section className="page"><div className="hero"><h1>Жизненный цикл заявок</h1><p>Расчёт → Заморозка → Завершена. Замороженные BOX_ID исключаются из новых расчётов.</p></div><div className="request-list">{state.requests.map(request => <article key={request.id}><div><span className={`request-status ${request.status}`}>{request.status}</span><h3>{request.id}</h3><p>{new Date(request.acceptedAt).toLocaleString('ru-RU')} · {new Set(request.rows.map(x => x.groupId)).size} коробов · {request.rows.reduce((n,x) => n + x.qty, 0)} шт.</p></div><div className="request-actions">{request.files?.xlsx && <a href={request.files.xlsx} target="_blank">XLSX</a>}{request.files?.pdf && <a href={request.files.pdf} target="_blank">PDF заявки</a>}{request.files?.pickingPdf && <a href={request.files.pickingPdf} target="_blank">Сборка</a>}{request.status === 'Заморозка' && <button className="primary" onClick={() => completeRequest(request.id)}>Завершить</button>}</div>{request.status === 'Заморозка' && <details><summary>Удалить физически отсутствующий короб</summary><div className="chips">{[...new Set(request.rows.map(x => x.groupId))].map(id => <button className="ghost" key={id} onClick={() => removeMissingBox(request.id, id)}>{id} ×</button>)}</div></details>}</article>)}</div></section>}
+
+      {tab === 'picking' && <section className="page"><div className="hero"><h1>Excel → PDF для сборки</h1><p>Совпадающие D:G объединяются; размер, цвет и артикул остаются раздельными.</p></div><FileCard title="Сторонний Excel WB" text="Наименование, Размер, Цвет, Артикул продавца в D:G" onFile={f => void makeExternalPicking(f)}/>{picking && <div className="picking-result"><div className="metrics"><Metric label="Изделий" value={picking.total}/><Metric label="Строк после объединения" value={picking.items.length}/></div><button className="primary" onClick={() => void downloadPicking()}><Download/> Скачать PDF</button><table><thead><tr><th>Наименование</th><th>Размер</th><th>Цвет</th><th>Артикул</th><th>Кол-во</th></tr></thead><tbody>{picking.items.slice(0,100).map((x,i) => <tr key={i}><td>{x.name}</td><td>{x.size}</td><td>{x.color}</td><td>{x.article}</td><td>{x.count}</td></tr>)}</tbody></table></div>}</section>}
+
+      {tab === 'audit' && <section className="page"><div className="hero"><h1>Локальный аудит</h1><p>Записи добавляются последовательно и входят в полный экспорт состояния.</p></div><div className="audit-list">{[...state.audit].reverse().map(x => <div key={x.id}><time>{new Date(x.at).toLocaleString('ru-RU')}</time><b>{x.action}</b><span>{x.details}</span></div>)}</div></section>}
+
+      {tab === 'settings' && <section className="page"><div className="hero"><h1>Настройки и резервная копия</h1><p>Основная база хранится в IndexedDB этого браузера.</p></div><div className="settings-grid"><div className="settings-card"><h3>Расчёт</h3><label>Целевой запас, дней<input type="number" value={state.settings.targetDays} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, targetDays: Number(e.target.value) } }))}/></label><label>Страховой запас, дней<input type="number" value={state.settings.safetyDays} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, safetyDays: Number(e.target.value) } }))}/></label><label>Максимум после поставки, дней<input type="number" value={state.settings.maxAfterDays} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, maxAfterDays: Number(e.target.value) } }))}/></label><label>Абсолютный максимум на SKU<input type="number" max="50" value={state.settings.maxPerSku} onChange={e => setState(s => ({ ...s, settings: { ...s.settings, maxPerSku: Number(e.target.value) } }))}/></label></div><div className="settings-card"><h3>Google Drive</h3><label>OAuth Client ID<input value={state.connection?.clientId || ''} onChange={e => setState(s => ({ ...s, connection: { clientId: e.target.value, folderId: s.connection?.folderId || '' } }))}/></label><label>ID папки<input value={state.connection?.folderId || ''} onChange={e => setState(s => ({ ...s, connection: { clientId: s.connection?.clientId || '', folderId: e.target.value } }))}/></label><p>Токен остаётся только в памяти вкладки.</p></div><div className="settings-card"><h3>Полное состояние</h3><button className="secondary" onClick={() => downloadBlob(exportState({ ...state, savedAt: new Date().toISOString() }), `FBS-Workspace-${Date.now()}.json`)}><Download/> Экспорт</button><button className="secondary" onClick={() => importRef.current?.click()}><Upload/> Импорт</button><input ref={importRef} hidden type="file" accept=".json" onChange={e => { const file = e.target.files?.[0]; if (file) void importState(file).then(value => { setState(value); message('Состояние восстановлено.'); }).catch(error => message(error.message)); e.currentTarget.value = ''; }}/></div></div></section>}
+    </main>{notice && <div className="toast">{notice}</div>}{busy && !['google','freeze'].includes(busy) && <div className="busy">Обрабатываем файл…</div>}</div>;
 }
 
+function Metric({ label, value }: { label: string; value: number }) { return <div><b>{value.toLocaleString('ru-RU')}</b><span>{label}</span></div>; }
+function Diagnostic({ title, rows }: { title: string; rows: string[] }) { return <details className="diagnostic"><summary>{title} <b>{rows.length}</b></summary>{rows.length ? <ul>{rows.slice(0,100).map((row,i) => <li key={i}>{row}</li>)}</ul> : <p>Нет позиций.</p>}</details>; }
 export default App;
-
-
-

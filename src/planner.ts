@@ -1,167 +1,190 @@
-import type { AcceptedRequest, CatalogItem, FbsItem, FbwItem, PhysicalBox, PlanRow, PlannerSettings, SalesItem } from './types';
+import type { AcceptedRequest, BalanceRisk, CatalogItem, FbsItem, FbwItem, PhysicalBox, PlanResult, PlanRow, PlannerSettings, SalesItem, UnfilledNeed } from './types';
 
-const sum = (xs: number[]) => xs.reduce((a,b)=>a+b,0);
-const rounded = (value: number) => Math.round(value * 10) / 10;
+const sum = (xs: Iterable<number>) => [...xs].reduce((a, b) => a + b, 0);
+const round = (n: number) => Math.round(n * 100) / 100;
+const byBarcode = <T extends { barcode: string }>(rows: T[]) => new Map(rows.map(row => [row.barcode, row]));
 
-type StockState = {
-  item: CatalogItem;
-  fbs: number;
-  fbw: number;
-  sales7: number;
-  dailyDemand: number;
-  current: number;
-  supplyDays: number | null;
-  target: number;
-  maxStock: number;
-  need: number;
-  active: boolean;
-  demandClass: string;
+type NeedState = {
+  item: CatalogItem; fbs: number; fbw: number; orders7: number; ordersPrev7: number; bought7: number; boughtPrev7: number;
+  buyoutRate: number; dailyDemand: number; stock: number; supplyDays: number | null; target: number; maxStock: number;
+  need: number; criticality: number;
 };
 
-function demandLimit(equivalentOrders14: number) {
-  if (equivalentOrders14 < 3) return { limit: 0, label: 'редкий' };
-  if (equivalentOrders14 < 7) return { limit: 10, label: 'медленный' };
-  if (equivalentOrders14 < 14) return { limit: 20, label: 'средний' };
-  if (equivalentOrders14 < 28) return { limit: 30, label: 'хороший' };
-  return { limit: 40, label: 'хит' };
+function fbwQuantity(item: FbwItem | undefined, settings: PlannerSettings) {
+  if (!item || settings.fbwMode === 'NONE') return 0;
+  if (settings.fbwMode === 'ALL') return sum(Object.values(item.warehouses));
+  return sum(settings.includedWarehouses.map(name => item.warehouses[name] || 0));
+}
+
+function criticality(days: number | null) {
+  if (days === null || days < 2) return 4;
+  if (days < 4) return 3;
+  if (days < 7) return 2;
+  return 1;
+}
+
+type Candidate = { box: PhysicalBox; useful: number; excess: number; coverage: number; critical: number; requiresApproval: boolean };
+type SearchState = { chosen: number[]; projected: Map<string, number>; units: number; score: number; palettes: Set<string> };
+
+function scoreCandidate(box: PhysicalBox, needs: Map<string, NeedState>, projected: Map<string, number>, palettes: Set<string>) {
+  let useful = 0, excess = 0, coverage = 0, critical = 0;
+  for (const component of box.components) {
+    const need = needs.get(component.barcode);
+    const before = projected.get(component.barcode) ?? need?.stock ?? 0;
+    const remaining = Math.max(0, (need?.target || 0) - before);
+    const partUseful = Math.min(component.qty, remaining);
+    useful += partUseful;
+    excess += component.qty - partUseful;
+    if (partUseful > 0) { coverage += 1; critical += partUseful * (need?.criticality || 0); }
+  }
+  const newPalette = box.palette && !palettes.has(box.palette) ? 1 : 0;
+  const levelPenalty = /верх|top|^[4-9]$/i.test(box.level) ? 0 : 1;
+  return { useful, excess, coverage, critical, scalar: critical * 1_000_000 + useful * 10_000 + coverage * 1_000 - excess * 100 - newPalette * 20 - levelPenalty };
+}
+
+function selectBoxes(candidates: PhysicalBox[], needs: Map<string, NeedState>, settings: PlannerSettings, approvedMix: Set<string>) {
+  const maxBoxes = Math.min(settings.maxBoxes ?? candidates.length, candidates.length);
+  const maxUnits = settings.maxUnits ?? Number.MAX_SAFE_INTEGER;
+  const ranked: Candidate[] = candidates.map(box => {
+    const s = scoreCandidate(box, needs, new Map(), new Set());
+    return { box, useful: s.useful, excess: s.excess, coverage: s.coverage, critical: s.critical, requiresApproval: box.type === 'MIX' && s.excess > 0 && !approvedMix.has(box.id) };
+  }).filter(x => x.useful > 0).sort((a, b) => b.critical - a.critical || b.useful - a.useful || b.coverage - a.coverage || a.excess - b.excess);
+  const pendingMix = ranked.filter(x => x.requiresApproval).map(x => x.box.id);
+  const usable = ranked.filter(x => !x.requiresApproval).map(x => x.box);
+  const beamCandidates = usable.slice(0, 280);
+  let beam: SearchState[] = [{ chosen: [], projected: new Map(), units: 0, score: 0, palettes: new Set() }];
+  const depth = Math.min(maxBoxes, 50);
+  for (let step = 0; step < depth; step += 1) {
+    const expanded: SearchState[] = [...beam];
+    for (const state of beam) {
+      const start = state.chosen.length ? state.chosen[state.chosen.length - 1] + 1 : 0;
+      for (let index = start; index < beamCandidates.length; index += 1) {
+        const box = beamCandidates[index];
+        if (state.units + box.totalQty > maxUnits) continue;
+        const s = scoreCandidate(box, needs, state.projected, state.palettes);
+        if (s.useful <= 0) continue;
+        const projected = new Map(state.projected);
+        let feasible = true;
+        for (const component of box.components) {
+          const need = needs.get(component.barcode);
+          if (!need) { feasible = false; break; }
+          const after = (projected.get(component.barcode) || 0) + component.qty;
+          if (after > need.maxStock) { feasible = false; break; }
+          projected.set(component.barcode, after);
+        }
+        if (!feasible) continue;
+        const palettes = new Set(state.palettes); if (box.palette) palettes.add(box.palette);
+        expanded.push({ chosen: [...state.chosen, index], projected, units: state.units + box.totalQty, score: state.score + s.scalar, palettes });
+      }
+    }
+    const unique = new Map<string, SearchState>();
+    expanded.sort((a, b) => b.score - a.score || b.units - a.units);
+    for (const state of expanded) {
+      const key = state.chosen.join(',');
+      if (!unique.has(key)) unique.set(key, state);
+      if (unique.size >= 180) break;
+    }
+    const next = [...unique.values()];
+    if (next[0]?.chosen.length === beam[0]?.chosen.length && step > 0) break;
+    beam = next;
+  }
+  const best = beam[0] || { chosen: [], projected: new Map(), units: 0, score: 0, palettes: new Set<string>() };
+  const selected = best.chosen.map(index => beamCandidates[index]);
+  const selectedIds = new Set(selected.map(box => box.id));
+  const projected = new Map(best.projected), palettes = new Set(best.palettes); let units = best.units;
+  while (selected.length < maxBoxes) {
+    let chosen: PhysicalBox | undefined, chosenScore = -Infinity;
+    for (const box of usable) {
+      if (selectedIds.has(box.id) || units + box.totalQty > maxUnits) continue;
+      const score = scoreCandidate(box, needs, projected, palettes); if (score.useful <= 0) continue;
+      const feasible = box.components.every(component => {
+        const need = needs.get(component.barcode); return Boolean(need) && (projected.get(component.barcode) ?? need!.stock) + component.qty <= need!.maxStock;
+      });
+      if (feasible && score.scalar > chosenScore) { chosen = box; chosenScore = score.scalar; }
+    }
+    if (!chosen) break;
+    selected.push(chosen); selectedIds.add(chosen.id); units += chosen.totalQty; if (chosen.palette) palettes.add(chosen.palette);
+    chosen.components.forEach(component => { const need = needs.get(component.barcode)!; projected.set(component.barcode, (projected.get(component.barcode) ?? need.stock) + component.qty); });
+  }
+  return { boxes: selected, projected, pendingMix };
 }
 
 export function buildPlan(input: {
-  fbs: FbsItem[]; sales: SalesItem[]; fbw: FbwItem[]; catalog: CatalogItem[];
-  includedWarehouses: string[]; boxes?: PhysicalBox[]; accepted?: AcceptedRequest[]; settings: PlannerSettings;
-}): PlanRow[] {
-  const { fbs, sales, fbw, catalog, includedWarehouses, boxes = [], settings } = input;
-  const fbsMap = new Map(fbs.map(x => [x.barcode, x.quantity]));
-  const fbwMap = new Map(fbw.map(x => [x.barcode, sum(includedWarehouses.map(w => x.warehouses[w] || 0))]));
-  const salesMap = new Map(sales.map(x => [x.article, x.ordered]));
-  const reserved = new Map<string,number>();
-  (input.accepted || []).filter(x=>x.status==='Принята').flatMap(x=>x.rows).forEach(x=>reserved.set(x.barcode,(reserved.get(x.barcode)||0)+x.qty));
-
-  const byArticle = new Map<string,CatalogItem[]>();
-  catalog.forEach(item => {
-    if (!item.barcode || !fbsMap.has(item.barcode)) return;
-    const variants=byArticle.get(item.article)||[];
-    if(!variants.some(variant=>variant.barcode===item.barcode)) variants.push(item);
-    byArticle.set(item.article,variants);
-  });
-
-  const states = new Map<string,StockState>();
-  const needs = new Map<string,StockState>();
-  byArticle.forEach((variants,article) => {
-    if(!variants.length) return;
-    const sales7=salesMap.get(article)||0;
-    const dailyDemand=sales7/7/variants.length;
-    const demand=demandLimit(dailyDemand*14);
-    const effectiveLimit=Math.min(settings.maxPerSku,demand.limit);
-    variants.forEach(item=>{
-      const currentFbs=fbsMap.get(item.barcode)||0;
-      const currentFbw=fbwMap.get(item.barcode)||0;
-      const current=currentFbs+currentFbw+(reserved.get(item.barcode)||0);
-      const supplyDays=dailyDemand>0?current/dailyDemand:null;
-      const target=Math.min(effectiveLimit,Math.ceil(dailyDemand*(settings.targetDays+settings.safetyDays)));
-      const maxByDays=dailyDemand>0?Math.floor(dailyDemand*settings.maxAfterDays):0;
-      const maxStock=Math.max(0,Math.min(effectiveLimit,maxByDays));
-      const need=Math.max(0,target-current);
-      const active=sales7>=settings.minOrders&&effectiveLimit>0&&need>0&&supplyDays!==null&&supplyDays<settings.minSupplyDays;
-      const state:StockState={item,fbs:currentFbs,fbw:currentFbw,sales7,dailyDemand,current,supplyDays,target,maxStock,need,active,demandClass:demand.label};
-      states.set(item.barcode,state);
-      if(active) needs.set(item.barcode,state);
-    });
-  });
-
-  if (!boxes.length) return [...needs.values()].map(need=>({
-    id:`suggestion-${need.item.barcode}`,groupId:`suggestion-${need.item.barcode}`,source:'auto',barcode:need.item.barcode,article:need.item.article,
-    name:need.item.name,size:need.item.size,fbs:need.fbs,fbw:need.fbw,sales7:need.sales7,dailyDemand:rounded(need.dailyDemand),stockBefore:need.current,
-    stockAfter:need.current+need.need,supplyDays:need.supplyDays===null?null:rounded(need.supplyDays),target:need.target,maxStock:need.maxStock,need:need.need,qty:need.need,
-    palette:'',placement:'',storageCells:'',boxType:'',confidence:'warning',
-    reason:`Нужно ${need.need} шт.: запас ${rounded(need.supplyDays||0)} дн., цель ${need.target}, максимум ${need.maxStock}. Физическая коробка не найдена.`,selected:true,
+  fbs: FbsItem[]; salesCurrent: SalesItem[]; salesPrevious: SalesItem[]; fbw: FbwItem[]; catalog: CatalogItem[];
+  boxes: PhysicalBox[]; accepted: AcceptedRequest[]; settings: PlannerSettings; selectedSku?: Set<string>;
+  approvedMix?: Set<string>; removedBoxes?: Set<string>;
+}): PlanResult {
+  const started = performance.now();
+  const fbs = byBarcode(input.fbs), fbw = byBarcode(input.fbw), current = byBarcode(input.salesCurrent), previous = byBarcode(input.salesPrevious);
+  const catalog = new Map<string, CatalogItem>();
+  [...input.catalog, ...input.fbs.map(x => ({ barcode: x.barcode, article: x.article, name: x.name, color: '', size: x.size }))].forEach(x => { if (x.barcode) catalog.set(x.barcode, x); });
+  const frozenBoxes = new Set<string>();
+  const frozenQty = new Map<string, number>();
+  input.accepted.filter(x => x.status === 'Заморозка').forEach(request => request.rows.forEach(row => {
+    frozenBoxes.add(row.groupId); frozenQty.set(row.barcode, (frozenQty.get(row.barcode) || 0) + row.qty);
   }));
-
-  const remaining=new Map([...needs].map(([barcode,need])=>[barcode,need.need]));
-  const projected=new Map([...states].map(([barcode,state])=>[barcode,state.current]));
-  const chosen:PhysicalBox[]=[];
-  const pool=boxes.filter(box=>box.components.length>0&&box.components.every(component=>fbsMap.has(component.barcode)));
-
-  while(true){
-    let best:PhysicalBox|undefined,bestScore=0,bestCovered=0,bestExcess=Infinity;
-    for(const box of pool){
-      const quantities=new Map<string,number>();
-      box.components.forEach(component=>quantities.set(component.barcode,(quantities.get(component.barcode)||0)+component.qty));
-      const feasible=[...quantities].every(([barcode,qty])=>{
-        const state=states.get(barcode);
-        return !!state&&(projected.get(barcode)||0)+qty<=state.maxStock;
-      });
-      if(!feasible) continue;
-      const useful=sum([...quantities].map(([barcode,qty])=>Math.min(remaining.get(barcode)||0,qty)));
-      const covered=[...quantities].filter(([barcode])=>(remaining.get(barcode)||0)>0).length;
-      const excess=sum([...quantities].map(([barcode,qty])=>Math.max(0,qty-(remaining.get(barcode)||0))));
-      if(useful>bestScore||(useful===bestScore&&covered>bestCovered)||(useful===bestScore&&covered===bestCovered&&useful>0&&excess<bestExcess)){
-        best=box;bestScore=useful;bestCovered=covered;bestExcess=excess;
-      }
-    }
-    if(!best||bestScore<=0) break;
-    chosen.push(best);pool.splice(pool.indexOf(best),1);
-    best.components.forEach(component=>{
-      remaining.set(component.barcode,Math.max(0,(remaining.get(component.barcode)||0)-component.qty));
-      projected.set(component.barcode,(projected.get(component.barcode)||0)+component.qty);
-    });
+  const selectedSku = input.selectedSku || new Set(catalog.keys());
+  const states = new Map<string, NeedState>();
+  const needs = new Map<string, NeedState>();
+  const risks: BalanceRisk[] = [];
+  for (const [barcode, item] of catalog) {
+    if (!selectedSku.has(barcode)) continue;
+    const s7 = current.get(barcode), p7 = previous.get(barcode);
+    const orders7 = s7?.ordered || 0, ordersPrev7 = p7?.ordered || 0;
+    const bought7 = s7?.bought || 0, boughtPrev7 = p7?.bought || 0;
+    const orders = orders7 + ordersPrev7, bought = bought7 + boughtPrev7;
+    if (orders < input.settings.minOrders) continue;
+    const buyoutRate = orders > 0 ? Math.max(0, Math.min(1, bought / orders)) : 0;
+    const weightedOrdersDaily = orders7 / 7 * .7 + ordersPrev7 / 7 * .3;
+    const dailyDemand = weightedOrdersDaily * buyoutRate;
+    if (dailyDemand <= 0) continue;
+    const fbsQty = fbs.get(barcode)?.quantity || 0;
+    const fbwQty = fbwQuantity(fbw.get(barcode), input.settings);
+    const stock = fbsQty + fbwQty + (frozenQty.get(barcode) || 0);
+    const supplyDays = stock / dailyDemand;
+    const target = Math.min(input.settings.maxPerSku, Math.ceil(dailyDemand * (input.settings.targetDays + input.settings.safetyDays)));
+    const maxStock = Math.min(input.settings.maxPerSku, Math.max(target, Math.floor(dailyDemand * input.settings.maxAfterDays)));
+    const need = Math.max(0, target - stock);
+    const state: NeedState = { item, fbs: fbsQty, fbw: fbwQty, orders7, ordersPrev7, bought7, boughtPrev7, buyoutRate, dailyDemand, stock, supplyDays, target, maxStock, need, criticality: criticality(supplyDays) };
+    states.set(barcode, state);
+    if (need > 0) needs.set(barcode, state);
+    if (orders >= 5 && buyoutRate < .45) risks.push({ barcode, article: item.article, size: item.size, orders, bought, buyoutRate, fbs: fbsQty, fbw: fbwQty, message: 'Заказов много, но выкуп низкий. Основная часть спроса остаётся в контуре WB.' });
+    else if (fbsQty < target && fbwQty >= target) risks.push({ barcode, article: item.article, size: item.size, orders, bought, buyoutRate, fbs: fbsQty, fbw: fbwQty, message: 'Дефицит FBS закрывается остатком выбранных складов FBW.' });
   }
-
-  const meta=new Map(catalog.map(item=>[item.barcode,item]));
-  const rows:PlanRow[]=[];
-  chosen.forEach(box=>box.components.forEach((component,index)=>{
-    const need=needs.get(component.barcode);
-    const state=states.get(component.barcode);
-    const item=meta.get(component.barcode);
-    const after=projected.get(component.barcode)||((state?.current||0)+component.qty);
-    rows.push({
-      id:`${box.id}-${component.barcode}-${index}`,groupId:box.id,source:'auto',barcode:component.barcode,
-      article:component.article||item?.article||'',name:item?.name||'',size:component.size||item?.size||'',
-      fbs:fbsMap.get(component.barcode)||0,fbw:fbwMap.get(component.barcode)||0,sales7:salesMap.get(component.article||item?.article||'')||0,
-      dailyDemand:rounded(state?.dailyDemand||0),stockBefore:state?.current||0,stockAfter:after,
-      supplyDays:state?.supplyDays===null?null:rounded(state?.supplyDays||0),target:state?.target||0,maxStock:state?.maxStock||0,need:need?.need||0,qty:component.qty,
-      palette:box.palette,placement:box.placement,storageCells:box.storageCells,boxType:box.type,confidence:need?'ok':'warning',
-      reason:need
-        ? `${box.type||'Физическая'}-коробка. Запас ${rounded(need.supplyDays||0)} дн.; потребность ${need.need}, цель ${need.target}. После выбранных коробок ${after} из допустимых ${need.maxStock} (${need.demandClass}).`
-        : `Обязательная позиция MIX-коробки. После выбранных коробок ${after} из допустимых ${state?.maxStock||0}.`,
-      selected:true,
-    });
-  }));
-
-  remaining.forEach((qty,barcode)=>{
-    if(qty<=0) return;
-    const need=needs.get(barcode)!;
-    rows.push({
-      id:`unresolved-${barcode}`,groupId:`unresolved-${barcode}`,source:'auto',barcode,article:need.item.article,name:need.item.name,size:need.item.size,
-      fbs:need.fbs,fbw:need.fbw,sales7:need.sales7,dailyDemand:rounded(need.dailyDemand),stockBefore:need.current,stockAfter:need.current+qty,
-      supplyDays:need.supplyDays===null?null:rounded(need.supplyDays),target:need.target,maxStock:need.maxStock,need:need.need,qty,
-      palette:'',placement:'',storageCells:'',boxType:'',confidence:'warning',
-      reason:`Осталось ${qty} шт. дефицита, но ни одна целая коробка не помещается в лимит ${need.maxStock}. Можно исключить или принять вручную.`,selected:true,
-    });
-  });
-  return rows;
+  const candidateBoxes = input.boxes.filter(box => !frozenBoxes.has(box.id) && !input.removedBoxes?.has(box.id)
+    && (input.settings.boxType === 'ANY' || box.type === input.settings.boxType)
+    && box.components.length > 0 && box.components.every(component => selectedSku.has(component.barcode) && states.has(component.barcode))
+    && box.components.some(component => needs.has(component.barcode)));
+  const picked = selectBoxes(candidateBoxes, states, input.settings, input.approvedMix || new Set());
+  const projected = new Map([...states].map(([key, value]) => [key, value.stock]));
+  const rows: PlanRow[] = [];
+  for (const box of picked.boxes) {
+    for (const [index, component] of box.components.entries()) {
+      const need = states.get(component.barcode)!;
+      const before = projected.get(component.barcode) || need.stock;
+      const usefulQty = Math.min(component.qty, Math.max(0, need.target - before));
+      const after = before + component.qty;
+      projected.set(component.barcode, after);
+      rows.push({ id: `${box.id}:${component.barcode}:${index}`, groupId: box.id, barcode: component.barcode, article: component.article || need.item.article,
+        name: need.item.name, color: component.color || need.item.color, size: component.size || need.item.size, fbs: need.fbs, fbw: need.fbw,
+        orders7: need.orders7, ordersPrev7: need.ordersPrev7, bought7: need.bought7, boughtPrev7: need.boughtPrev7,
+        buyoutRate: round(need.buyoutRate), dailyDemand: round(need.dailyDemand), stockBefore: need.stock, stockAfter: after,
+        supplyDays: round(need.supplyDays || 0), target: need.target, maxStock: need.maxStock, need: need.need, qty: component.qty,
+        warehouse: box.warehouse, palette: box.palette, placement: box.placement, side: box.side, level: box.level,
+        storageCells: box.storageCells, boxType: box.type, usefulQty, oversupplyQty: component.qty - usefulQty,
+        criticality: need.criticality, selected: true,
+        reason: `${box.type}: полезно ${usefulQty} из ${component.qty}; запас ${round(need.supplyDays || 0)} дн.; выкуп ${(need.buyoutRate * 100).toFixed(0)}%.`,
+      });
+    }
+  }
+  const unfilled: UnfilledNeed[] = [];
+  for (const [barcode, need] of needs) {
+    const missing = Math.max(0, need.target - (projected.get(barcode) || need.stock));
+    if (missing > 0) unfilled.push({ barcode, article: need.item.article, name: need.item.name, size: need.item.size, need: missing, criticality: need.criticality, reason: 'Не найден подходящий свободный физический BOX_ID в заданных лимитах.' });
+  }
+  unfilled.sort((a, b) => b.criticality - a.criticality || b.need - a.need);
+  return { rows, unfilled, risks, pendingMixBoxIds: picked.pendingMix, stats: { eligibleSku: needs.size, selectedSku: selectedSku.size,
+    candidateBoxes: candidateBoxes.length, selectedBoxes: picked.boxes.length, selectedUnits: sum(picked.boxes.map(x => x.totalQty)), elapsedMs: round(performance.now() - started) } };
 }
 
-export function addManualRows(plan:PlanRow[],items:CatalogItem[],fbs:FbsItem[],fbw:FbwItem[],warehouses:string[]){
-  const fm=new Map(fbs.map(item=>[item.barcode,item.quantity]));
-  const wm=new Map(fbw.map(item=>[item.barcode,sum(warehouses.map(warehouse=>item.warehouses[warehouse]||0))]));
-  const next=plan.map(item=>({...item}));
-  items.forEach(item=>{
-    const hit=next.find(row=>row.barcode===item.barcode&&row.source==='manual');
-    if(hit){hit.qty+=1;hit.stockAfter+=1;hit.selected=true;return;}
-    const current=(fm.get(item.barcode)||0)+(wm.get(item.barcode)||0);
-    next.push({id:`manual-${item.barcode}`,groupId:`manual-${item.barcode}`,source:'manual',barcode:item.barcode,article:item.article,name:item.name,size:item.size,
-      fbs:fm.get(item.barcode)||0,fbw:wm.get(item.barcode)||0,sales7:0,dailyDemand:0,stockBefore:current,stockAfter:current+1,supplyDays:null,target:0,maxStock:0,need:0,qty:1,
-      palette:'',placement:'',storageCells:'',boxType:'',confidence:'warning',reason:'Добавлено пользователем в продажу. Проверьте количество перед принятием.',selected:true});
-  });
-  return next;
-}
-
-export function removePlanRow(plan: PlanRow[], id: string) {
-  const row = plan.find(item => item.id === id);
-  if (!row) return plan;
-  const wholeBox = row.source === 'auto'
-    && !row.groupId.startsWith('unresolved-')
-    && !row.groupId.startsWith('suggestion-');
-  return plan.filter(item => wholeBox ? item.groupId !== row.groupId : item.id !== id);
-}
+export function removePhysicalBox(rows: PlanRow[], boxId: string) { return rows.filter(row => row.groupId !== boxId); }

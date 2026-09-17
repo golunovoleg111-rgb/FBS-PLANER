@@ -1,4 +1,5 @@
 import * as XLSX from 'xlsx';
+import type { PickingResult } from './converter';
 import type { PlanRow } from './types';
 
 declare global { interface Window { pdfMake?: { createPdf: (doc: unknown) => { getBlob: (cb: (blob: Blob) => void) => void } } } }
@@ -17,7 +18,8 @@ const stamp = () => new Intl.DateTimeFormat('ru-RU', { dateStyle: 'short', timeS
 
 export function requestXlsx(rows: PlanRow[]) {
   const data = rows.map(row => ({
-    'Коробка': row.groupId.startsWith('manual-') || row.groupId.startsWith('unresolved-') || row.groupId.startsWith('suggestion-') ? '' : row.groupId,
+    'Коробка': row.groupId,
+    'Склад': row.warehouse,
     'Паллета': row.palette,
     'Расстановка': row.placement,
     'Ячейки хранения': row.storageCells,
@@ -28,7 +30,10 @@ export function requestXlsx(rows: PlanRow[]) {
     'Количество': row.qty,
     'FBS сейчас': row.fbs,
     'FBW выбранных складов': row.fbw,
-    'Продажи 7 дней': row.sales7,
+    'Заказы последние 7 дней': row.orders7,
+    'Заказы предыдущие 7 дней': row.ordersPrev7,
+    'Выкупы последние 7 дней': row.bought7,
+    'Коэффициент выкупа': row.buyoutRate,
     'Средние продажи в день': row.dailyDemand,
     'Остаток до заявки': row.stockBefore,
     'Остаток после заявки': row.stockAfter,
@@ -38,7 +43,7 @@ export function requestXlsx(rows: PlanRow[]) {
   }));
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.json_to_sheet(data);
-  ws['!cols'] = [14,12,18,20,28,28,10,18,12,12,20,16,20,20,18,22,48].map(wch => ({ wch }));
+  ws['!cols'] = [14,14,12,18,20,28,28,10,18,12,12,20,20,20,18,20,20,18,22,48].map(wch => ({ wch }));
   XLSX.utils.book_append_sheet(wb, ws, 'Заявка');
   return new Blob([XLSX.write(wb, { bookType: 'xlsx', type: 'array' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
 }
@@ -50,7 +55,7 @@ export function requestPdf(rows: PlanRow[]): Promise<Blob> {
   ]];
   let lastGroup = '';
   rows.forEach(row => {
-    const group = row.groupId.startsWith('manual-') || row.groupId.startsWith('unresolved-') || row.groupId.startsWith('suggestion-') ? 'Вручную' : row.groupId;
+    const group = row.groupId;
     const first = group !== lastGroup;
     body.push([
       { text: first ? [group, row.palette && `Паллета: ${row.palette}`, row.placement].filter(Boolean).join('\n') : '', bold: first },
@@ -70,6 +75,19 @@ export function requestPdf(rows: PlanRow[]): Promise<Blob> {
     styles: { title: { fontSize: 18, bold: true, color: '#172033' }, th: { bold: true, color: '#172033' } },
   };
   return loadPdfMake().then(()=>new Promise(resolve => window.pdfMake!.createPdf(doc).getBlob(resolve)));
+}
+
+export function pickingPdf(result: PickingResult, title = 'Сборочное задание FBS'): Promise<Blob> {
+  const body: Array<Array<string | Record<string, unknown>>> = [[
+    { text: 'Наименование', style: 'th' }, { text: 'Размер', style: 'th' }, { text: 'Цвет', style: 'th' },
+    { text: 'Артикул продавца', style: 'th' }, { text: 'Кол-во', style: 'th' },
+  ]];
+  result.items.forEach(item => body.push([item.name, { text: item.size, bold: true, fontSize: 12 }, item.color, item.article, { text: String(item.count), alignment: 'center', bold: true, fontSize: 13 }]));
+  const doc: any = { pageSize: 'A4', pageMargins: [30, 32, 30, 32], content: [
+    { text: title, style: 'title' }, { text: `Всего: ${result.total} шт. · Позиций: ${result.items.length}`, margin: [0, 3, 0, 14], color: '#52606d' },
+    { table: { headerRows: 1, dontBreakRows: true, widths: ['*', 42, 75, 130, 48], body }, layout: { fillColor: (i: number) => i === 0 ? '#e8eefb' : i % 2 ? '#fff' : '#f7f9fc', hLineColor: () => '#aab2bf', vLineColor: () => '#aab2bf' } },
+  ], footer: (current: number, pages: number) => ({ text: `${current} / ${pages}`, alignment: 'right', margin: [0, 8, 30, 0] }), defaultStyle: { font: 'Roboto', fontSize: 10 }, styles: { title: { fontSize: 18, bold: true }, th: { bold: true } } };
+  return loadPdfMake().then(() => new Promise(resolve => window.pdfMake!.createPdf(doc).getBlob(resolve)));
 }
 
 export function downloadBlob(blob: Blob, filename: string) {

@@ -46,19 +46,32 @@ export function parseFbs(buffer: ArrayBuffer): FbsItem[] {
 }
 
 export function parseSales(buffer: ArrayBuffer): SalesItem[] {
-  const { headers, rows } = findTable(buffer, ['Артикул продавца', 'Заказано']);
+  let headers: string[] | undefined, rows: Row[] = [];
+  for (const sheet of workbookRows(buffer)) {
+    const at = sheet.findIndex(row => row.some(cell => norm(cell).includes(norm('Артикул продавца'))) && row.some(cell => norm(cell).includes(norm('Баркод'))) && row.some(cell => norm(cell).includes(norm('Выкупили'))));
+    if (at < 0) continue;
+    const parent = sheet[at - 1] || [];
+    headers = sheet[at].map((cell, index) => [parent[index], cell].map(text).filter(Boolean).join(' '));
+    rows = sheet.slice(at + 1); break;
+  }
+  if (!headers) throw new Error('Не найдены обязательные столбцы отчёта продаж WB.');
   const c = {
-    article: col(headers, ['Артикул продавца']), ordered: col(headers, ['Заказано, шт.', 'Заказано']),
-    bought: col(headers, ['Выкупили, шт.', 'Выкупили']), revenue: col(headers, ['К перечислению за товар', 'Сумма заказов']),
+    article: col(headers, ['Артикул продавца']), ordered: col(headers, ['Заказано шт.', 'Заказано, шт.', 'Заказано']),
+    bought: col(headers, ['Выкупили, шт.', 'Выкупили']), revenue: col(headers, ['К перечислению за товар']),
+    barcode: col(headers, ['Баркод', 'Штрихкод']), size: col(headers, ['Размер']), name: col(headers, ['Наименование', 'Название']),
   };
   const map = new Map<string, SalesItem>();
   rows.forEach(row => {
-    const article = text(row[c.article]); if (!article) return;
-    const hit = map.get(article) || { article, ordered: 0, bought: 0, revenue: 0 };
+    const article = text(row[c.article]);
+    const barcode = c.barcode >= 0 ? text(row[c.barcode]).replace(/\.0$/, '') : '';
+    const size = c.size >= 0 ? text(row[c.size]) : '';
+    if (!article || (!barcode && !size)) return;
+    const key = barcode || `${article}\u0000${size}`;
+    const hit = map.get(key) || { barcode, article, name: c.name >= 0 ? text(row[c.name]) : '', size, ordered: 0, bought: 0, revenue: 0 };
     hit.ordered += num(row[c.ordered]);
     hit.bought += c.bought >= 0 ? num(row[c.bought]) : 0;
     hit.revenue += c.revenue >= 0 ? num(row[c.revenue]) : 0;
-    map.set(article, hit);
+    map.set(key, hit);
   });
   const items = [...map.values()];
   if (!items.length) throw new Error('В отчёте продаж не найдено ни одной позиции.');
